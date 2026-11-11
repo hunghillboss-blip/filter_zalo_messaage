@@ -24,6 +24,10 @@ from scanner import (
     scan_messages_for_ticker,
     export_results,
     generate_html_report,
+    get_last_scan_diagnostics,
+    clean_surrounding_garbage,
+    search_binary_ticker,
+    extract_text_representations,
 )
 from config_manager import load_config, save_config
 
@@ -334,5 +338,66 @@ class TestScanner(unittest.TestCase):
         self.assertIn("000001.log", found_basenames)
         self.assertIn("000002.ldb", found_basenames)
 
+    def test_inspect_and_filter_leveldb_utf16le(self):
+        # Kiểm tra phát hiện tin nhắn tiếng Việt được mã hóa UTF-16LE trong LevelDB/IndexedDB
+        utf16_file = os.path.join(self.test_dir, "000088.log")
+        user_msg = {
+            "dName": "Quốc Cường Ichimoku",
+            "content": "vùng cản ngắn hạn của CEO vẫn là 13-13.5 a nhé",
+            "room": "Kỹ Thuật Nhóm Bất Động Sản",
+            "ts": 1715000000000
+        }
+        json_bytes = json.dumps(user_msg, ensure_ascii=False).encode("utf-16le")
+        with open(utf16_file, "wb") as f:
+            f.write(b"\x00\x01\x02\x03" + json_bytes + b"\x00\x00")
+
+        results, err = inspect_and_filter_leveldb(utf16_file, "CEO")
+        self.assertIsNone(err)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["ticker"], "CEO")
+        self.assertEqual(results[0]["sender"], "Quốc Cường Ichimoku")
+        self.assertEqual(results[0]["group"], "Kỹ Thuật Nhóm Bất Động Sản")
+        self.assertIn("vùng cản ngắn hạn của CEO", results[0]["content"])
+
+    def test_search_binary_ticker_utf16le_odd(self):
+        # Kiểm tra chuỗi UTF-16LE bắt đầu tại byte offset lẻ (odd byte offset)
+        msg = "khuyến nghị mua CEO giá 12.5"
+        raw = b"\xaa\xbb\xcc" + msg.encode("utf-16le") + b"\xdd"
+        extracted = search_binary_ticker(raw, "CEO")
+        self.assertTrue(len(extracted) >= 1)
+        self.assertIn("khuyến nghị mua CEO", extracted[0])
+
+    def test_clean_surrounding_garbage(self):
+        # Kiểm tra loại bỏ ký tự CJK do lệch byte UTF-16LE
+        raw_text = "瞈vùng cản ngắn hạn của CEO vẫn là 13-13.5 a nhé∑"
+        cleaned = clean_surrounding_garbage(raw_text)
+        self.assertEqual(cleaned, "vùng cản ngắn hạn của CEO vẫn là 13-13.5 a nhé")
+
+    def test_inspect_and_filter_db_utf16le_blob(self):
+        # Kiểm tra SQLite lưu tin nhắn dưới dạng BLOB UTF-16LE
+        db_path = os.path.join(self.test_dir, "blob_test.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE t (id INT, sender TEXT, payload BLOB, send_time BIGINT);")
+        viet_msg = "Chốt lời CEO quanh giá 14".encode("utf-16le")
+        conn.execute("INSERT INTO t VALUES (1, 'Admin', ?, 1700000000000);", (sqlite3.Binary(viet_msg),))
+        conn.commit()
+        conn.close()
+
+        results, err = inspect_and_filter_db(db_path, "CEO")
+        self.assertIsNone(err)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["sender"], "Admin")
+        self.assertIn("Chốt lời CEO quanh giá 14", results[0]["content"])
+
+    def test_diagnostics(self):
+        # Kiểm tra cấu trúc nhật ký chẩn đoán quét
+        scan_messages_for_ticker("CEO")
+        diag = get_last_scan_diagnostics()
+        self.assertIn("checked_dirs", diag)
+        self.assertIn("total_sources", diag)
+        self.assertIn("summary_text", diag)
+        self.assertEqual(diag["last_ticker"], "CEO")
+
 if __name__ == "__main__":
     unittest.main()
+

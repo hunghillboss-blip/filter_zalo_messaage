@@ -1,7 +1,14 @@
 import sys
 import argparse
 from config_manager import load_config, save_config
-from scanner import scan_messages_for_ticker, export_results, find_all_sqlite_dbs, find_all_zalo_storage_sources, get_possible_zalo_dirs
+from scanner import (
+    scan_messages_for_ticker,
+    export_results,
+    find_all_sqlite_dbs,
+    find_all_zalo_storage_sources,
+    get_possible_zalo_dirs,
+    get_last_scan_diagnostics
+)
 
 def menu_zalo_dir(config):
     while True:
@@ -12,7 +19,7 @@ def menu_zalo_dir(config):
         if custom_path:
             print(f"Thư mục hiện tại (Tùy chỉnh): {custom_path}")
         else:
-            print("Thư mục hiện tại: Tự động phát hiện (%LOCALAPPDATA%\\ZaloPC)")
+            print("Thư mục hiện tại: Tự động phát hiện (%LOCALAPPDATA%\\ZaloPC & %APPDATA%\\ZaloApp)")
 
         # Thử tìm kiếm database với cấu hình hiện tại
         sql_dbs, lvl_files = find_all_zalo_storage_sources()
@@ -20,10 +27,10 @@ def menu_zalo_dir(config):
         print(f"Trạng thái: Đã phát hiện {total_sources} nguồn dữ liệu Zalo ({len(sql_dbs)} SQLite, {len(lvl_files)} LevelDB/IndexedDB).")
         if sql_dbs or lvl_files:
             all_preview = sql_dbs + lvl_files
-            for idx, db in enumerate(all_preview[:3], start=1):
+            for idx, db in enumerate(all_preview[:5], start=1):
                 print(f"  {idx}. {db}")
-            if total_sources > 3:
-                print(f"  ... và {total_sources - 3} file khác.")
+            if total_sources > 5:
+                print(f"  ... và {total_sources - 5} file khác.")
 
         print("\nCác tùy chọn:")
         print("  1. Thiết lập đường dẫn thư mục Zalo mới")
@@ -110,13 +117,27 @@ def menu_watchlist(config):
                 save_config(config)
                 print(f"[+] Đã đặt [{target}] làm mã mặc định.")
             else:
-                print("[!] Mã không hợp lệ hoặc chưa nằm trong danh sách.")
+                print("[!] Không tìm thấy mã hợp lệ.")
 
         elif opt == "0":
             break
 
+def print_diagnostics():
+    diag = get_last_scan_diagnostics()
+    summary = diag.get("summary_text", "")
+    if summary:
+        print("\n" + summary)
+    else:
+        print("\n[i] Chưa có dữ liệu quét gần nhất. Đang thực hiện kiểm tra cấu hình...")
+        zdirs = get_possible_zalo_dirs()
+        sql, lvl = find_all_zalo_storage_sources(zdirs)
+        print(f"Tổng số thư mục Zalo tìm thấy: {len(zdirs)}")
+        for d in zdirs:
+            print(f"  * {d}")
+        print(f"Tổng số nguồn dữ liệu: {len(sql) + len(lvl)} ({len(sql)} SQLite, {len(lvl)} LevelDB/IndexedDB)")
+
 def run_single_filter(ticker):
-    print(f"\n[*] Đang tiến hành quét dữ liệu cho mã: [{ticker}]...")
+    print(f"\n[*] Đang quét tin nhắn cho mã [{ticker}]...")
     def print_progress(msg, pct):
         print(f"    [{pct}%] {msg}")
 
@@ -126,7 +147,8 @@ def run_single_filter(ticker):
         return
 
     if not results:
-        print(f"[-] Không có tin nhắn nào nhắc tới mã [{ticker}].")
+        diag = get_last_scan_diagnostics()
+        print(f"[-] Không có tin nhắn nào nhắc tới mã [{ticker}]. (Đã quét {diag.get('total_sources', 0)} file dữ liệu)")
     else:
         files = export_results(results, ticker)
         print(f"[+] Tìm thấy {len(results)} tin nhắn liên quan đến [{ticker}].")
@@ -145,6 +167,7 @@ def run_cli_interactive():
         print("3. Quét toàn bộ các mã trong danh sách")
         print("4. Quản lý danh sách mã & đổi mã mặc định")
         print("5. Cấu hình & Kiểm tra thư mục dữ liệu Zalo")
+        print("6. Xem báo cáo chi tiết các file đã quét (Diagnostics)")
         print("0. Thoát")
         
         choice = input("Nhập thao tác: ").strip()
@@ -180,6 +203,9 @@ def run_cli_interactive():
         elif choice == "5":
             menu_zalo_dir(config)
 
+        elif choice == "6":
+            print_diagnostics()
+
         elif choice == "0":
             print("Đã thoát chương trình.")
             break
@@ -190,6 +216,7 @@ def main():
     parser.add_argument("--all", action="store_true", help="Quét toàn bộ danh sách mã theo dõi trong chế độ tự động")
     parser.add_argument("--ticker", type=str, help="Quét trực tiếp một mã cổ phiếu cụ thể")
     parser.add_argument("--zalo-dir", type=str, help="Chỉ định thư mục dữ liệu Zalo PC")
+    parser.add_argument("--diag", action="store_true", help="Hiển thị thông tin chẩn đoán các file dữ liệu Zalo tìm thấy")
 
     args = parser.parse_args()
 
@@ -198,6 +225,10 @@ def main():
         cfg["custom_zalo_path"] = args.zalo_dir
         save_config(cfg)
         print(f"[+] Đã cấu hình thư mục Zalo: {args.zalo_dir}")
+
+    if args.diag:
+        print_diagnostics()
+        return
 
     if args.ticker:
         run_single_filter(args.ticker)

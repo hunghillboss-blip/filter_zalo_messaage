@@ -7,13 +7,13 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 from config_manager import load_config, save_config, get_base_dir
-from scanner import scan_messages_for_ticker, export_results
+from scanner import scan_messages_for_ticker, export_results, get_last_scan_diagnostics
 
 class ZaloStockFilterGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Bộ Lọc Tin Nhắn Chứng Khoán Zalo PC")
-        self.root.geometry("850x620")
+        self.root.geometry("880x620")
         self.root.minsize(750, 500)
 
         self.config = load_config()
@@ -96,6 +96,9 @@ class ZaloStockFilterGUI:
 
         self.btn_open_last = ttk.Button(r2_frame, text="🌐 Xem Báo Cáo HTML", command=self._on_open_last_html, state="disabled")
         self.btn_open_last.pack(side="right", padx=5)
+
+        self.btn_diag = ttk.Button(r2_frame, text="📋 Chi Tiết Quét", command=self._on_show_diagnostics)
+        self.btn_diag.pack(side="right", padx=5)
 
         # Hàng 3: Cấu hình thư mục Zalo PC
         r3_frame = ttk.Frame(control_frame)
@@ -212,7 +215,7 @@ class ZaloStockFilterGUI:
             disp = custom if len(custom) <= 45 else custom[:20] + "..." + custom[-22:]
             self.lbl_zalo_path.config(text=f"📁 {disp}", foreground="#006600")
         else:
-            self.lbl_zalo_path.config(text="🔍 Tự động phát hiện (%LOCALAPPDATA%\\ZaloPC)", foreground="#555555")
+            self.lbl_zalo_path.config(text="🔍 Tự động phát hiện (AppData / ZaloPC / ZaloApp)", foreground="#555555")
 
     def _on_choose_zalo_dir(self):
         dir_selected = filedialog.askdirectory(title="Chọn thư mục chứa dữ liệu Zalo PC")
@@ -325,13 +328,60 @@ class ZaloStockFilterGUI:
             messagebox.showerror("Thông Báo Quét Dữ Liệu Zalo", errors[0])
         else:
             ticker_list_str = ", ".join(tickers)
+            diag = get_last_scan_diagnostics()
+            total_src = diag.get("total_sources", 0)
             messagebox.showinfo(
                 "Kết quả Quét", 
-                f"Đã quét các cơ sở dữ liệu Zalo PC (SQLite & IndexedDB LevelDB) nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
+                f"Đã quét qua {total_src} file cơ sở dữ liệu Zalo PC (SQLite & LevelDB/IndexedDB) nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
                 f"Gợi ý kiểm tra:\n"
-                f"1. Hãy mở Zalo PC và bấm 'Đồng bộ tin nhắn từ điện thoại' để Zalo tải tin nhắn các nhóm về máy tính.\n"
-                f"2. Bạn có thể thử tìm một từ chắc chắn đang có trong tin nhắn gần đây (ví dụ: 'chào', 'alo' hoặc mã cổ phiếu khác đang chat)."
+                f"1. Nhấn nút '📋 Chi Tiết Quét' trên giao diện để xem danh sách file và thư mục đã quét.\n"
+                f"2. Hãy mở Zalo PC và bấm 'Đồng bộ tin nhắn từ điện thoại' để Zalo tải tin nhắn các nhóm về máy tính.\n"
+                f"3. Bạn có thể thử tìm một từ chắc chắn đang có trong tin nhắn gần đây (ví dụ: 'chào', 'alo' hoặc mã cổ phiếu khác đang chat).\n"
+                f"4. Nếu bạn lưu dữ liệu Zalo ở ổ đĩa khác (như D:\\ZaloPC), hãy nhấn nút '⚙️ Chọn Thư Mục...'."
             )
+
+    def _on_show_diagnostics(self):
+        diag = get_last_scan_diagnostics()
+        diag_win = tk.Toplevel(self.root)
+        diag_win.title("Nhật Ký & Chi Tiết Quét Cơ Sở Dữ Liệu Zalo PC")
+        diag_win.geometry("720x520")
+        diag_win.minsize(550, 400)
+
+        frame = ttk.Frame(diag_win, padding="15")
+        frame.pack(fill="both", expand=True)
+
+        lbl_title = ttk.Label(frame, text="📋 Chi Tiết Phát Hiện & Quét Cơ Sở Dữ Liệu", font=("Segoe UI", 12, "bold"), foreground=self.PRIMARY_COLOR)
+        lbl_title.pack(anchor="w", pady=(0, 8))
+
+        summary = diag.get("summary_text", "")
+        if not summary:
+            summary = "Chưa thực hiện lần quét nào hoặc chưa tìm thấy dữ liệu.\n\nHãy nhấn nút '🔍 Quét Mã Đang Chọn' để bắt đầu quét."
+
+        text_area = tk.Text(frame, wrap="none", font=("Consolas", 9), padx=10, pady=10)
+        scroll_y = ttk.Scrollbar(frame, orient="vertical", command=text_area.yview)
+        scroll_x = ttk.Scrollbar(frame, orient="horizontal", command=text_area.xview)
+        text_area.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
+        scroll_y.pack(side="right", fill="y")
+        scroll_x.pack(side="bottom", fill="x")
+        text_area.pack(fill="both", expand=True)
+
+        text_area.insert("1.0", summary)
+        text_area.config(state="disabled")
+
+        btn_frame = ttk.Frame(frame, padding="0 10 0 0")
+        btn_frame.pack(fill="x")
+
+        def copy_to_clipboard():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(summary)
+            messagebox.showinfo("Thành Công", "Đã sao chép toàn bộ nhật ký quét vào Clipboard!")
+
+        btn_copy = ttk.Button(btn_frame, text="📄 Sao Chép Nhật Ký", command=copy_to_clipboard)
+        btn_copy.pack(side="left")
+
+        btn_close = ttk.Button(btn_frame, text="Đóng", command=diag_win.destroy)
+        btn_close.pack(side="right")
 
     def _on_tree_double_click(self, event):
         selected_item = self.tree.focus()

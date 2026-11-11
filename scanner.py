@@ -17,6 +17,22 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
+# Biến lưu trữ nhật ký chẩn đoán quét lần gần nhất
+_last_scan_diagnostics = {
+    "checked_dirs": [],
+    "sqlite_dbs": [],
+    "leveldb_files": [],
+    "total_sources": 0,
+    "last_ticker": "",
+    "results_count": 0,
+    "errors": [],
+    "summary_text": ""
+}
+
+def get_last_scan_diagnostics():
+    """Trả về bản sao thông tin chẩn đoán quét gần nhất để hiển thị trên giao diện hoặc xuất log."""
+    return _last_scan_diagnostics.copy()
+
 def decompress_snappy(data):
     """
     Giải nén dữ liệu Snappy thuần Python (không phụ thuộc vào thư viện bên ngoài hay C++).
@@ -244,6 +260,97 @@ def is_sqlite_file(file_path):
     except Exception:
         return False
 
+def extract_text_representations(byte_data):
+    """
+    Chuyển đổi một khối byte thành các chuỗi văn bản đại diện:
+    - UTF-8
+    - UTF-16 LE (offset chẵn)
+    - UTF-16 LE (offset lẻ)
+    Hỗ trợ 100% các tin nhắn tiếng Việt có dấu được V8/Chromium/Electron lưu trữ dưới dạng 2-byte UTF-16LE.
+    """
+    texts = []
+    if not byte_data or len(byte_data) == 0:
+        return texts
+
+    # 1. UTF-8
+    try:
+        texts.append(byte_data.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+
+    # 2. UTF-16 LE chẵn (offset 0)
+    try:
+        texts.append(byte_data.decode("utf-16le", errors="ignore"))
+    except Exception:
+        pass
+
+    # 3. UTF-16 LE lẻ (offset 1)
+    if len(byte_data) > 1:
+        try:
+            texts.append(byte_data[1:].decode("utf-16le", errors="ignore"))
+        except Exception:
+            pass
+
+    return texts
+
+def search_binary_ticker(data, ticker, case_sensitive=False):
+    """
+    Tìm kiếm trực tiếp mã cổ phiếu dưới dạng byte UTF-8 và UTF-16LE trong buffer nhị phân,
+    cắt ra các cửa sổ văn bản giải mã đúng alignment để không bao giờ bỏ sót tin nhắn.
+    """
+    extracted_texts = []
+    if not data or not ticker:
+        return extracted_texts
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+
+    # 1. Byte pattern UTF-8
+    try:
+        p_u8 = re.compile(rf"(?:^|[^\w\x00])({re.escape(ticker)})(?=[^\w\x00]|$)" .encode("utf-8"), flags)
+        for m in p_u8.finditer(data):
+            pos = m.start(1)
+            start = max(0, pos - 1500)
+            end = min(len(data), pos + 1500)
+            try:
+                extracted_texts.append(data[start:end].decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Byte pattern UTF-16 LE
+    try:
+        parts = []
+        for c in ticker:
+            if case_sensitive:
+                parts.append(re.escape(c.encode("utf-16le")))
+            else:
+                parts.append(rb"[" + bytes([ord(c.lower()), ord(c.upper())]) + rb"]\x00")
+        p_u16 = re.compile(rb"(?:^|[^\w\x00]|\x00)(" + rb"".join(parts) + rb")(?=[^\w\x00]|\x00|$)", re.IGNORECASE)
+        for m in p_u16.finditer(data):
+            match_pos = m.start(1)
+            start = max(0, match_pos - 2000)
+            if (match_pos - start) % 2 != 0:
+                start += 1
+            end = min(len(data), match_pos + 2000)
+            try:
+                extracted_texts.append(data[start:end].decode("utf-16le", errors="ignore"))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return extracted_texts
+
+def clean_surrounding_garbage(text):
+    """Xóa các ký tự CJK, symbol lạ, control characters do lệch byte UTF-16LE ở đầu và cuối chuỗi."""
+    if not text:
+        return ""
+    # Giữ nguyên tiếng Việt và ASCII, xóa các ký tự ngoài dải chữ viết thông thường
+    text = re.sub(r"^[\u2200-\ufffd\x00-\x1f]+", "", text)
+    text = re.sub(r"[\u2200-\ufffd\x00-\x1f]+$", "", text)
+    return text.strip()
+
 def get_possible_zalo_dirs():
     """
     Tìm tất cả các thư mục có khả năng lưu trữ dữ liệu Zalo PC trên máy tính.
@@ -273,6 +380,7 @@ def get_possible_zalo_dirs():
         add_dir(os.path.join(localappdata, "ZaloPC"))
         add_dir(os.path.join(localappdata, "Zalo"))
         add_dir(os.path.join(localappdata, "ZaloData"))
+        add_dir(os.path.join(localappdata, "ZaloApp"))
         add_dir(os.path.join(localappdata, "Programs", "Zalo"))
 
     # %APPDATA% (C:\Users\<User>\AppData\Roaming)
@@ -290,22 +398,44 @@ def get_possible_zalo_dirs():
             os.path.join("AppData", "Local", "ZaloPC"),
             os.path.join("AppData", "Local", "Zalo"),
             os.path.join("AppData", "Local", "ZaloData"),
+            os.path.join("AppData", "Local", "ZaloApp"),
             os.path.join("AppData", "Local", "Programs", "Zalo"),
             os.path.join("AppData", "Roaming", "ZaloPC"),
             os.path.join("AppData", "Roaming", "ZaloApp"),
             os.path.join("AppData", "Roaming", "ZaloData"),
+            os.path.join("AppData", "Roaming", "Zalo"),
             os.path.join("Documents", "Zalo Received Files"),
         ]:
             add_dir(os.path.join(user_home, sub))
     except Exception:
         pass
 
-    # 4. Các ổ đĩa phổ biến nếu người dùng di chuyển Zalo sang ổ khác (D:\ZaloPC, E:\ZaloPC...)
-    for drive in ["D:\\", "E:\\", "F:\\", "C:\\"]:
+    # 4. Quét qua các profile người dùng trong C:\Users nếu chạy với quyền Admin
+    try:
+        system_drive = os.environ.get("SystemDrive", "C:")
+        users_dir = os.path.join(system_drive, os.sep, "Users")
+        if os.path.isdir(users_dir):
+            for user_entry in os.listdir(users_dir):
+                user_path = os.path.join(users_dir, user_entry)
+                if os.path.isdir(user_path) and user_entry.lower() not in ["public", "all users", "default", "default user"]:
+                    for sub in [
+                        os.path.join("AppData", "Local", "ZaloPC"),
+                        os.path.join("AppData", "Local", "Zalo"),
+                        os.path.join("AppData", "Local", "ZaloData"),
+                        os.path.join("AppData", "Roaming", "ZaloPC"),
+                        os.path.join("AppData", "Roaming", "ZaloApp"),
+                        os.path.join("AppData", "Roaming", "ZaloData"),
+                    ]:
+                        add_dir(os.path.join(user_path, sub))
+    except Exception:
+        pass
+
+    # 5. Các ổ đĩa phổ biến nếu người dùng di chuyển Zalo sang ổ khác (D:\ZaloPC, E:\ZaloPC...)
+    for drive in ["D:\\", "E:\\", "F:\\", "C:\\", "D:/", "E:/", "F:/", "C:/"]:
         for folder in ["ZaloPC", "Zalo", "ZaloData", "ZaloApp"]:
             add_dir(os.path.join(drive, folder))
 
-    # 5. Linux / macOS (nếu chạy Wine hoặc client Zalo desktop tương ứng)
+    # 6. Linux / macOS (nếu chạy Wine hoặc client Zalo desktop tương ứng)
     try:
         user_home = os.path.expanduser("~")
         add_dir(os.path.join(user_home, ".config", "ZaloPC"))
@@ -320,7 +450,7 @@ def get_possible_zalo_dirs():
 
 def find_all_zalo_storage_sources(search_dirs=None):
     """
-    Tìm tất cả các file lưu trữ tin nhắn Zalo PC gồm cả SQLite (.db) và IndexedDB / LevelDB (.ldb, .log).
+    Tìm tất cả các file lưu trữ tin nhắn Zalo PC gồm cả SQLite (.db) và IndexedDB / LevelDB / Data files (.ldb, .log, .dat, .bin).
     Duyệt đệ quy và hỗ trợ cả symbolic links/junctions.
     Trả về tuple: (sqlite_paths, leveldb_paths)
     """
@@ -344,7 +474,7 @@ def find_all_zalo_storage_sources(search_dirs=None):
             if (ext in [".db", ".sqlite", ".sqlite3"] or is_sqlite_file(abs_f)) and not is_leveldb_sstable(abs_f):
                 seen.add(abs_f)
                 found_sqlite.append(abs_f)
-            elif ext in [".ldb", ".sst", ".log"] or is_leveldb_sstable(abs_f) or "leveldb" in abs_f.lower() or "indexeddb" in abs_f.lower():
+            else:
                 seen.add(abs_f)
                 found_leveldb.append(abs_f)
             continue
@@ -354,20 +484,31 @@ def find_all_zalo_storage_sources(search_dirs=None):
                 "crashpad", "gpucache", "temp", "node_modules", ".git", "asset", "blob_storage", "code cache"
             ]]
             root_lower = root.lower()
-            is_in_leveldb_dir = ("leveldb" in root_lower or "indexeddb" in root_lower or "storage" in root_lower)
+            is_in_data_dir = any(k in root_lower for k in ["leveldb", "indexeddb", "storage", "sqlite", "zalopc", "zaloapp", "zalodata"])
 
             for file in files:
                 lower_file = file.lower()
                 ext = os.path.splitext(lower_file)[1]
 
-                # Bỏ qua các file media, thực thi, ảnh, audio
-                if ext in [".exe", ".dll", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".webp", ".asar", ".tmp", ".zip"]:
+                # Bỏ qua các file media, thực thi, ảnh, audio, web resources
+                if ext in [
+                    ".exe", ".dll", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".wav", ".ico",
+                    ".webp", ".asar", ".zip", ".7z", ".rar", ".tmp", ".pak", ".node", ".json", ".css",
+                    ".html", ".js", ".map", ".svg", ".ttf", ".woff", ".woff2"
+                ]:
                     continue
-                if lower_file.endswith("-wal") or lower_file.endswith("-shm") or lower_file.endswith("-journal"):
+                if lower_file.endswith("-wal") or lower_file.endswith("-shm") or lower_file.endswith("-journal") or lower_file in ["lock", "log.old"]:
                     continue
 
                 full_path = os.path.abspath(os.path.join(root, file))
                 if full_path in seen:
+                    continue
+
+                try:
+                    sz = os.path.getsize(full_path)
+                    if sz == 0 or sz > 600 * 1024 * 1024:
+                        continue
+                except Exception:
                     continue
 
                 # 1. Kiểm tra SQLite
@@ -376,7 +517,7 @@ def find_all_zalo_storage_sources(search_dirs=None):
                     found_sqlite.append(full_path)
                     continue
 
-                # 2. Kiểm tra LevelDB / IndexedDB
+                # 2. Kiểm tra LevelDB / IndexedDB / Data files
                 if ext in [".ldb", ".sst"]:
                     seen.add(full_path)
                     found_leveldb.append(full_path)
@@ -384,15 +525,14 @@ def find_all_zalo_storage_sources(search_dirs=None):
 
                 if ext == ".log":
                     stem = os.path.splitext(lower_file)[0]
-                    if stem.isdigit() or is_in_leveldb_dir:
+                    if stem.isdigit() or is_in_data_dir:
                         seen.add(full_path)
                         found_leveldb.append(full_path)
                         continue
 
-                if is_in_leveldb_dir and (is_leveldb_sstable(full_path) or ext == ""):
-                    if is_leveldb_sstable(full_path):
-                        seen.add(full_path)
-                        found_leveldb.append(full_path)
+                if is_in_data_dir or ext in [".dat", ".bin", ".data"] or ext == "" or is_leveldb_sstable(full_path):
+                    seen.add(full_path)
+                    found_leveldb.append(full_path)
 
     # Sắp xếp ưu tiên
     def score_sqlite(path):
@@ -409,11 +549,12 @@ def find_all_zalo_storage_sources(search_dirs=None):
     def score_leveldb(path):
         lower = path.lower()
         score = 0
-        if "indexeddb" in lower: score += 10
+        if "indexeddb" in lower: score += 12
+        if "file__0" in lower: score += 10
         if "chat.zalo.me" in lower: score += 8
-        if "file__0" in lower: score += 6
-        if lower.endswith(".ldb"): score += 4
-        if lower.endswith(".log"): score += 2
+        if lower.endswith(".ldb"): score += 5
+        if lower.endswith(".log"): score += 4
+        if lower.endswith(".dat"): score += 2
         return score
 
     found_sqlite.sort(key=score_sqlite, reverse=True)
@@ -462,7 +603,7 @@ def extract_clean_text(raw_val):
             data = json.loads(val)
             if isinstance(data, dict):
                 # Thử các trường phổ biến chứa nội dung tin nhắn
-                for key in ["content", "message", "msg", "text", "body", "title", "description", "data", "caption"]:
+                for key in ["content", "message", "msg", "text", "body", "title", "description", "data", "caption", "subTitle", "desc"]:
                     v = data.get(key)
                     if isinstance(v, str) and v.strip():
                         return v.strip()
@@ -532,7 +673,6 @@ def find_best_columns(col_names):
                 break
 
     # 4. Tìm các cột có khả năng chứa nội dung tin nhắn (ưu tiên cột có tên rõ ràng trước)
-    # Tuyệt đối không chọn cột ID thuần túy (msgid, cliMsgId, type, status...)
     for col in col_names:
         cl = col.lower()
         if any(bad in cl for bad in ["id", "type", "status", "seq", "flag", "size", "width", "height", "version", "crc"]):
@@ -553,6 +693,7 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
     """
     Quét một file SQLite để tìm các tin nhắn chứa mã cổ phiếu.
     Sử dụng bản sao tạm thời gồm cả file .db, -wal, -shm để không bị khóa file và đọc được dữ liệu mới nhất.
+    Hỗ trợ cả UTF-8 và UTF-16LE cho các cột dạng BLOB.
     """
     results = []
     temp_dir = tempfile.gettempdir()
@@ -598,7 +739,6 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
             if any(s in table.lower() for s in skip_tables):
                 continue
             try:
-                # Lấy thông tin cột
                 cursor.execute(f"PRAGMA table_info([{table}]);")
                 columns_info = cursor.fetchall()
                 col_names = [col[1] for col in columns_info]
@@ -610,7 +750,6 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
                 if not content_candidates:
                     continue
 
-                # Truy vấn dữ liệu bảng
                 selected_cols = [f"[{col}]" for col in col_names]
                 query = f"SELECT {', '.join(selected_cols)} FROM [{table}]"
                 cursor.execute(query)
@@ -619,7 +758,6 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
                 for row in rows:
                     row_dict = dict(zip(col_names, row))
 
-                    # Kiểm tra các cột nội dung ứng viên
                     matched_content = None
                     # 1. Thử các cột ứng viên trước
                     for c_col in content_candidates:
@@ -630,15 +768,16 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
                         if isinstance(raw_c, str):
                             text_val = raw_c
                         elif isinstance(raw_c, (bytes, bytearray)):
-                            try:
-                                text_val = raw_c.decode("utf-8", errors="ignore")
-                            except Exception:
-                                pass
+                            candidates_t = extract_text_representations(raw_c)
+                            for ct in candidates_t:
+                                if pattern.search(ct):
+                                    text_val = ct
+                                    break
                         if text_val and pattern.search(text_val):
                             matched_content = extract_clean_text(text_val)
                             break
 
-                    # 2. Nếu chưa thấy, thử quét qua tất cả các cột văn bản khác trong dòng (trừ cột thời gian/người gửi)
+                    # 2. Nếu chưa thấy, thử các cột khác trong dòng
                     if not matched_content:
                         for c_col, raw_c in row_dict.items():
                             if c_col in [time_col, sender_col, group_col] or c_col in content_candidates:
@@ -649,10 +788,11 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
                             if isinstance(raw_c, str):
                                 text_val = raw_c
                             elif isinstance(raw_c, (bytes, bytearray)):
-                                try:
-                                    text_val = raw_c.decode("utf-8", errors="ignore")
-                                except Exception:
-                                    pass
+                                candidates_t = extract_text_representations(raw_c)
+                                for ct in candidates_t:
+                                    if pattern.search(ct):
+                                        text_val = ct
+                                        break
                             if text_val and pattern.search(text_val):
                                 matched_content = extract_clean_text(text_val)
                                 break
@@ -667,7 +807,7 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
                             "time": format_timestamp(ts_val),
                             "sender": str(sender_val) if sender_val is not None else "",
                             "group": str(group_val) if group_val is not None else "",
-                            "content": matched_content.strip(),
+                            "content": clean_surrounding_garbage(matched_content),
                             "source_table": table,
                             "source_db": os.path.basename(db_path)
                         })
@@ -675,6 +815,12 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
                 continue
 
     except Exception as e:
+        # Nếu SQLite query lỗi (ví dụ file bị mã hóa hoặc non-standard), fallback quét nhị phân
+        lvl_res, _ = inspect_and_filter_leveldb(temp_file, ticker, case_sensitive)
+        if lvl_res:
+            for r in lvl_res:
+                r["source_db"] = os.path.basename(db_path)
+            return lvl_res, None
         return results, f"Lỗi truy vấn {os.path.basename(db_path)}: {e}"
     finally:
         if conn:
@@ -739,7 +885,7 @@ def extract_message_from_data(data, ticker_pattern):
         return None
 
     content = None
-    for k in ["content", "message", "msg", "text", "body", "dMsg", "description", "title", "caption", "raw_text"]:
+    for k in ["content", "message", "msg", "text", "body", "dMsg", "description", "title", "caption", "subTitle", "desc", "raw_text"]:
         v = data.get(k)
         if isinstance(v, str) and ticker_pattern.search(v):
             content = extract_clean_text(v)
@@ -784,7 +930,7 @@ def extract_message_from_data(data, ticker_pattern):
             break
 
     return {
-        "content": content,
+        "content": clean_surrounding_garbage(content),
         "sender": sender,
         "group": group,
         "time": format_timestamp(ts)
@@ -793,6 +939,7 @@ def extract_message_from_data(data, ticker_pattern):
 def extract_from_raw_window(window, ticker_pattern):
     """
     Bóc tách thông tin tin nhắn từ cửa sổ văn bản khi không parse được JSON hoàn chỉnh.
+    Hỗ trợ xử lý sạch sẽ các ký tự thừa do chuyển đổi UTF-16LE.
     """
     content = None
     c_m = re.search(r'"(?:content|message|msg|text|body|dMsg|description|title)"\s*:\s*"((?:\\.|[^"\\])+)"', window)
@@ -820,6 +967,10 @@ def extract_from_raw_window(window, ticker_pattern):
         if len(cand) >= 3 and ticker_pattern.search(cand):
             content = cand
 
+    if not content:
+        return None
+
+    content = clean_surrounding_garbage(content)
     if not content or len(content) > 3000:
         return None
 
@@ -859,8 +1010,8 @@ def extract_from_raw_window(window, ticker_pattern):
 
 def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
     """
-    Quét một file LevelDB / IndexedDB (.ldb, .sst, .log) để tìm các tin nhắn chứa mã cổ phiếu.
-    Hỗ trợ giải nén Snappy SSTable blocks và WAL 32KB log records.
+    Quét một file LevelDB / IndexedDB / Data (.ldb, .sst, .log, .dat, .bin) để tìm các tin nhắn chứa mã cổ phiếu.
+    Hỗ trợ giải nén Snappy SSTable blocks, WAL 32KB log records, và phân tích đa bảng mã UTF-8 & UTF-16LE.
     """
     results = []
     try:
@@ -886,9 +1037,9 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
             except Exception:
                 pass
         except Exception as e:
-            return results, f"Không thể truy cập file LevelDB {os.path.basename(file_path)}: {e}"
+            return results, f"Không thể truy cập file {os.path.basename(file_path)}: {e}"
     except Exception as e:
-        return results, f"Lỗi đọc file LevelDB {os.path.basename(file_path)}: {e}"
+        return results, f"Lỗi đọc file {os.path.basename(file_path)}: {e}"
 
     if not file_bytes:
         return results, None
@@ -896,7 +1047,7 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
     flags = 0 if case_sensitive else re.IGNORECASE
     pattern = re.compile(rf"\b{re.escape(ticker)}\b", flags)
 
-    # Thu thập các đoạn văn bản (text blocks) từ file
+    # Thu thập các đoạn văn bản (text blocks) từ file với cả UTF-8 và UTF-16LE
     text_chunks = []
 
     # 1. Nếu là SSTable (.ldb / .sst), giải mã các Data Blocks
@@ -906,25 +1057,20 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
     if is_sstable:
         sstable_blocks = extract_sstable_blocks(file_bytes)
         for block in sstable_blocks:
-            try:
-                text_chunks.append(block.decode("utf-8", errors="ignore"))
-            except Exception:
-                pass
+            text_chunks.extend(extract_text_representations(block))
 
     # 2. Nếu là file log (.log), trích xuất các bản ghi 32KB
-    if ext == ".log":
+    if ext == ".log" or "log" in ext:
         log_recs = extract_log_records(file_bytes)
         for rec in log_recs:
-            try:
-                text_chunks.append(rec.decode("utf-8", errors="ignore"))
-            except Exception:
-                pass
+            text_chunks.extend(extract_text_representations(rec))
 
-    # 3. Đồng thời luôn decode toàn bộ file bytes thô để không bỏ sót bất kỳ byte nào
-    try:
-        text_chunks.append(file_bytes.decode("utf-8", errors="ignore"))
-    except Exception:
-        pass
+    # 3. Luôn decode toàn bộ file bytes thô (cả UTF-8 và UTF-16LE chẵn/lẻ)
+    text_chunks.extend(extract_text_representations(file_bytes))
+
+    # 4. Trích xuất cửa sổ nhị phân trực tiếp (Binary pattern search) để đảm bảo không bỏ sót bất kỳ byte nào
+    bin_windows = search_binary_ticker(file_bytes, ticker, case_sensitive)
+    text_chunks.extend(bin_windows)
 
     file_name = os.path.basename(file_path)
 
@@ -945,14 +1091,14 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
             if json_data:
                 msg_info = extract_message_from_data(json_data, pattern)
 
-            # Nếu chưa được, thử fallback
+            # Nếu chưa được, thử fallback theo cửa sổ văn bản
             if not msg_info or not msg_info.get("content"):
                 window = text[max(0, pos - 1500) : min(len(text), pos + 1500)]
                 msg_info = extract_from_raw_window(window, pattern)
 
             if msg_info and msg_info.get("content") and pattern.search(msg_info["content"]):
-                # Loại trừ trường hợp content chỉ là URL hoặc path
                 c = msg_info["content"].strip()
+                # Loại trừ trường hợp content chỉ là URL hoặc path
                 if c.startswith(("http://", "https://")) and " " not in c:
                     continue
 
@@ -966,7 +1112,7 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
                     "source_db": file_name
                 })
 
-    # Khử trùng lặp nội bộ trong cùng 1 file (giữa data block và raw bytes)
+    # Khử trùng lặp nội bộ trong cùng 1 file (giữa data block, raw bytes và binary search)
     unique_file_results = []
     seen = set()
     for r in results:
@@ -981,7 +1127,9 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
     """
     Quét toàn bộ các cơ sở dữ liệu Zalo (cả SQLite và IndexedDB/LevelDB) tìm thấy để lọc tin nhắn chứa ticker.
     Hỗ trợ progress_callback(msg, percent) để cập nhật giao diện.
+    Ghi nhận đầy đủ thông tin chẩn đoán (diagnostics) để người dùng có thể kiểm tra.
     """
+    global _last_scan_diagnostics
     ticker = ticker.strip().upper()
     if not ticker:
         return [], "Mã cổ phiếu không hợp lệ."
@@ -992,19 +1140,32 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
     if progress_callback:
         progress_callback("Đang tìm kiếm thư mục và cơ sở dữ liệu (SQLite & LevelDB)...", 5)
 
-    sqlite_dbs, leveldb_files = find_all_zalo_storage_sources()
+    zalo_dirs = get_possible_zalo_dirs()
+    sqlite_dbs, leveldb_files = find_all_zalo_storage_sources(zalo_dirs)
     total_files = len(sqlite_dbs) + len(leveldb_files)
 
+    _last_scan_diagnostics = {
+        "checked_dirs": zalo_dirs,
+        "sqlite_dbs": [{"path": p, "size": os.path.getsize(p) if os.path.exists(p) else 0} for p in sqlite_dbs],
+        "leveldb_files": [{"path": p, "size": os.path.getsize(p) if os.path.exists(p) else 0} for p in leveldb_files],
+        "total_sources": total_files,
+        "last_ticker": ticker,
+        "results_count": 0,
+        "errors": [],
+        "summary_text": ""
+    }
+
     if total_files == 0:
-        zalo_dirs = get_possible_zalo_dirs()
         checked_dirs_str = "\n".join(f" - {d}" for d in zalo_dirs) if zalo_dirs else " (Không tìm thấy thư mục nào)"
-        return [], (
+        err_msg = (
             f"Không tìm thấy file cơ sở dữ liệu Zalo PC nào (SQLite hoặc LevelDB) trên máy tính này.\n\n"
             f"Đã tự động kiểm tra các thư mục:\n{checked_dirs_str}\n\n"
             f"Hướng dẫn khắc phục:\n"
             f"1. Hãy đảm bảo Zalo PC đã được cài đặt và bạn đã đăng nhập tài khoản.\n"
             f"2. Nếu bạn cài hoặc chuyển Zalo sang ổ khác (như D:\\ZaloPC), hãy nhấn nút '⚙️ Chọn Thư Mục Zalo' để trỏ đến thư mục đó."
         )
+        _last_scan_diagnostics["errors"].append(err_msg)
+        return [], err_msg
 
     all_results = []
     errors = []
@@ -1024,7 +1185,7 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
         if err:
             errors.append(err)
 
-    # 2. Quét các file LevelDB / IndexedDB (.ldb, .log)
+    # 2. Quét các file LevelDB / IndexedDB / Data files (.ldb, .log, .dat...)
     for lvl_path in leveldb_files:
         processed += 1
         lvl_name = os.path.basename(lvl_path)
@@ -1053,6 +1214,31 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
 
     # Sắp xếp theo thời gian mới nhất lên đầu
     unique_results.sort(key=lambda x: str(x["time"]), reverse=True)
+
+    # Cập nhật thông tin chẩn đoán
+    _last_scan_diagnostics["results_count"] = len(unique_results)
+    _last_scan_diagnostics["errors"] = errors
+    summary_lines = [
+        f"=== BÁO CÁO CHI TIẾT QUÉT DỮ LIỆU ZALO PC ===",
+        f"Mã tìm kiếm: {ticker}",
+        f"Thời điểm quét: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Tổng số nguồn dữ liệu tìm thấy: {total_files} ({len(sqlite_dbs)} SQLite, {len(leveldb_files)} LevelDB/IndexedDB)",
+        f"Tổng số tin nhắn tìm thấy: {len(unique_results)} tin nhắn",
+        "",
+        "--- CÁC THƯ MỤC ĐÃ ĐƯỢC KIỂM TRA ---"
+    ]
+    for d in zalo_dirs:
+        summary_lines.append(f"  * {d}")
+    summary_lines.append("")
+    summary_lines.append("--- CÁC FILE CƠ SỞ DỮ LIỆU ĐÃ QUÉT ---")
+    for item in _last_scan_diagnostics["sqlite_dbs"]:
+        size_kb = item["size"] // 1024
+        summary_lines.append(f"  [SQLite] {item['path']} ({size_kb} KB)")
+    for item in _last_scan_diagnostics["leveldb_files"]:
+        size_kb = item["size"] // 1024
+        summary_lines.append(f"  [LevelDB] {item['path']} ({size_kb} KB)")
+    
+    _last_scan_diagnostics["summary_text"] = "\n".join(summary_lines)
 
     if progress_callback:
         progress_callback(f"Tìm thấy {len(unique_results)} tin nhắn liên quan đến [{ticker}].", 100)
