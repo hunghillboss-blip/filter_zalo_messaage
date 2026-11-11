@@ -364,11 +364,41 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
 
                     # Kiểm tra các cột nội dung ứng viên
                     matched_content = None
+                    # 1. Thử các cột ứng viên trước
                     for c_col in content_candidates:
                         raw_c = row_dict.get(c_col)
-                        if raw_c and isinstance(raw_c, str) and pattern.search(raw_c):
-                            matched_content = extract_clean_text(raw_c)
+                        if raw_c is None:
+                            continue
+                        text_val = None
+                        if isinstance(raw_c, str):
+                            text_val = raw_c
+                        elif isinstance(raw_c, (bytes, bytearray)):
+                            try:
+                                text_val = raw_c.decode("utf-8", errors="ignore")
+                            except Exception:
+                                pass
+                        if text_val and pattern.search(text_val):
+                            matched_content = extract_clean_text(text_val)
                             break
+
+                    # 2. Nếu chưa thấy, thử quét qua tất cả các cột văn bản khác trong dòng (trừ cột thời gian/người gửi)
+                    if not matched_content:
+                        for c_col, raw_c in row_dict.items():
+                            if c_col in [time_col, sender_col, group_col] or c_col in content_candidates:
+                                continue
+                            if raw_c is None or isinstance(raw_c, (int, float, bool)):
+                                continue
+                            text_val = None
+                            if isinstance(raw_c, str):
+                                text_val = raw_c
+                            elif isinstance(raw_c, (bytes, bytearray)):
+                                try:
+                                    text_val = raw_c.decode("utf-8", errors="ignore")
+                                except Exception:
+                                    pass
+                            if text_val and pattern.search(text_val):
+                                matched_content = extract_clean_text(text_val)
+                                break
 
                     if matched_content:
                         ts_val = row_dict.get(time_col) if time_col else ""

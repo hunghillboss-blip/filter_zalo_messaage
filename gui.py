@@ -102,14 +102,15 @@ class ZaloStockFilterGUI:
         r3_frame.pack(fill="x", pady=(8, 2))
 
         ttk.Label(r3_frame, text="Thư mục Zalo:").pack(side="left", padx=(0, 5))
-        self.lbl_zalo_path = ttk.Label(r3_frame, text="", font=("Segoe UI", 9), foreground="#333333")
-        self.lbl_zalo_path.pack(side="left", padx=5)
-
-        btn_pick_dir = ttk.Button(r3_frame, text="⚙️ Chọn Thư Mục Zalo...", command=self._on_choose_zalo_dir)
-        btn_pick_dir.pack(side="left", padx=5)
 
         btn_reset_dir = ttk.Button(r3_frame, text="🔄 Tự Động", command=self._on_reset_zalo_dir)
-        btn_reset_dir.pack(side="left", padx=3)
+        btn_reset_dir.pack(side="right", padx=3)
+
+        btn_pick_dir = ttk.Button(r3_frame, text="⚙️ Chọn Thư Mục...", command=self._on_choose_zalo_dir)
+        btn_pick_dir.pack(side="right", padx=5)
+
+        self.lbl_zalo_path = ttk.Label(r3_frame, text="", font=("Segoe UI", 9), foreground="#333333")
+        self.lbl_zalo_path.pack(side="left", fill="x", expand=True, padx=5)
 
         # 3. Status Bar & Progress
         status_frame = ttk.Frame(self.root, padding="15 5 15 5")
@@ -323,7 +324,14 @@ class ZaloStockFilterGUI:
         elif errors:
             messagebox.showerror("Thông Báo Quét Dữ Liệu Zalo", errors[0])
         else:
-            messagebox.showinfo("Kết quả", "Không tìm thấy tin nhắn nào chứa các mã đã chọn.")
+            ticker_list_str = ", ".join(tickers)
+            messagebox.showinfo(
+                "Kết quả Quét", 
+                f"Đã quét các cơ sở dữ liệu Zalo PC nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
+                f"Gợi ý kiểm tra:\n"
+                f"1. Hãy mở Zalo PC và bấm 'Đồng bộ tin nhắn từ điện thoại' để Zalo tải tin nhắn các nhóm về máy tính.\n"
+                f"2. Bạn có thể thử tìm một từ chắc chắn đang có trong tin nhắn gần đây (ví dụ: 'chào', 'alo' hoặc mã cổ phiếu khác đang chat)."
+            )
 
     def _on_tree_double_click(self, event):
         selected_item = self.tree.focus()
