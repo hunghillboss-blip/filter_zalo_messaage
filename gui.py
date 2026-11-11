@@ -4,7 +4,7 @@ import subprocess
 import threading
 import webbrowser
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 from config_manager import load_config, save_config, get_base_dir
 from scanner import scan_messages_for_ticker, export_results
@@ -24,6 +24,7 @@ class ZaloStockFilterGUI:
         self._apply_style()
         self._build_ui()
         self._refresh_watchlist_ui()
+        self._refresh_zalo_path_ui()
 
     def _apply_style(self):
         style = ttk.Style()
@@ -57,7 +58,7 @@ class ZaloStockFilterGUI:
         lbl_sub.pack(anchor="w")
 
         # 2. Watchlist & Controls Frame
-        control_frame = ttk.LabelFrame(self.root, text=" Quản lý Danh Sách Mã Cổ Phiếu Theo Dõi ", padding="10")
+        control_frame = ttk.LabelFrame(self.root, text=" Quản lý & Cấu Hình Quét ", padding="10")
         control_frame.pack(fill="x", padx=15, pady=5)
 
         # Hàng 1: Watchlist & Chọn mã
@@ -96,6 +97,20 @@ class ZaloStockFilterGUI:
         self.btn_open_last = ttk.Button(r2_frame, text="🌐 Xem Báo Cáo HTML", command=self._on_open_last_html, state="disabled")
         self.btn_open_last.pack(side="right", padx=5)
 
+        # Hàng 3: Cấu hình thư mục Zalo PC
+        r3_frame = ttk.Frame(control_frame)
+        r3_frame.pack(fill="x", pady=(8, 2))
+
+        ttk.Label(r3_frame, text="Thư mục Zalo:").pack(side="left", padx=(0, 5))
+        self.lbl_zalo_path = ttk.Label(r3_frame, text="", font=("Segoe UI", 9), foreground="#333333")
+        self.lbl_zalo_path.pack(side="left", padx=5)
+
+        btn_pick_dir = ttk.Button(r3_frame, text="⚙️ Chọn Thư Mục Zalo...", command=self._on_choose_zalo_dir)
+        btn_pick_dir.pack(side="left", padx=5)
+
+        btn_reset_dir = ttk.Button(r3_frame, text="🔄 Tự Động", command=self._on_reset_zalo_dir)
+        btn_reset_dir.pack(side="left", padx=3)
+
         # 3. Status Bar & Progress
         status_frame = ttk.Frame(self.root, padding="15 5 15 5")
         status_frame.pack(fill="x")
@@ -110,7 +125,7 @@ class ZaloStockFilterGUI:
         table_frame = ttk.LabelFrame(self.root, text=" Kết Quả Tin Nhắn Tìm Thấy ", padding="5")
         table_frame.pack(fill="both", expand=True, padx=15, pady=(0, 10))
 
-        cols = ("idx", "time", "ticker", "sender", "group", "content")
+        cols = ("idx", "time", "ticker", "sender", "group", "content", "source_db")
         self.tree = ttk.Treeview(table_frame, columns=cols, show="headings", selectmode="browse")
 
         self.tree.heading("idx", text="#")
@@ -119,13 +134,15 @@ class ZaloStockFilterGUI:
         self.tree.heading("sender", text="Người Gửi")
         self.tree.heading("group", text="Nhóm/Cuộc Trò Chuyện")
         self.tree.heading("content", text="Nội Dung Tin Nhắn")
+        self.tree.heading("source_db", text="File Nguồn")
 
-        self.tree.column("idx", width=40, anchor="center")
-        self.tree.column("time", width=130, anchor="center")
-        self.tree.column("ticker", width=60, anchor="center")
-        self.tree.column("sender", width=120)
-        self.tree.column("group", width=150)
-        self.tree.column("content", width=300)
+        self.tree.column("idx", width=35, anchor="center")
+        self.tree.column("time", width=125, anchor="center")
+        self.tree.column("ticker", width=55, anchor="center")
+        self.tree.column("sender", width=110)
+        self.tree.column("group", width=130)
+        self.tree.column("content", width=320)
+        self.tree.column("source_db", width=110)
 
         # Scrollbars
         scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
@@ -188,6 +205,28 @@ class ZaloStockFilterGUI:
         self._refresh_watchlist_ui()
         messagebox.showinfo("Thành công", f"Đã xóa mã [{ticker}] khỏi danh sách.")
 
+    def _refresh_zalo_path_ui(self):
+        custom = self.config.get("custom_zalo_path", "").strip()
+        if custom:
+            disp = custom if len(custom) <= 45 else custom[:20] + "..." + custom[-22:]
+            self.lbl_zalo_path.config(text=f"📁 {disp}", foreground="#006600")
+        else:
+            self.lbl_zalo_path.config(text="🔍 Tự động phát hiện (%LOCALAPPDATA%\\ZaloPC)", foreground="#555555")
+
+    def _on_choose_zalo_dir(self):
+        dir_selected = filedialog.askdirectory(title="Chọn thư mục chứa dữ liệu Zalo PC")
+        if dir_selected:
+            self.config["custom_zalo_path"] = dir_selected
+            save_config(self.config)
+            self._refresh_zalo_path_ui()
+            messagebox.showinfo("Thành công", f"Đã lưu đường dẫn Zalo PC:\n{dir_selected}")
+
+    def _on_reset_zalo_dir(self):
+        self.config["custom_zalo_path"] = ""
+        save_config(self.config)
+        self._refresh_zalo_path_ui()
+        messagebox.showinfo("Thông báo", "Đã đặt lại chế độ tự động phát hiện thư mục Zalo PC.")
+
     def _on_set_default(self):
         ticker = self.combo_ticker.get().strip().upper()
         if not ticker:
@@ -234,6 +273,7 @@ class ZaloStockFilterGUI:
         self.root.after(0, lambda: self._set_ui_state(True))
         all_results = []
         exported_all = []
+        errors = []
 
         for idx, ticker in enumerate(tickers, start=1):
             def prog(msg, pct):
@@ -246,10 +286,12 @@ class ZaloStockFilterGUI:
                 all_results.extend(res)
                 files = export_results(res, ticker)
                 exported_all.extend(files)
+            if err:
+                errors.append(err)
 
-        self.root.after(0, lambda: self._scan_finished(all_results, exported_all, tickers))
+        self.root.after(0, lambda: self._scan_finished(all_results, exported_all, tickers, errors))
 
-    def _scan_finished(self, results, exported_files, tickers):
+    def _scan_finished(self, results, exported_files, tickers, errors=None):
         self._set_ui_state(False)
         self.current_results = results
         self.last_exported_files = exported_files
@@ -266,7 +308,8 @@ class ZaloStockFilterGUI:
                 r.get("ticker", ""),
                 r.get("sender", ""),
                 r.get("group", ""),
-                r.get("content", "")
+                r.get("content", ""),
+                r.get("source_db", "")
             ))
 
         if exported_files:
@@ -277,6 +320,8 @@ class ZaloStockFilterGUI:
 
         if results:
             messagebox.showinfo("Hoàn Tất", f"Đã tìm thấy {len(results)} tin nhắn!\nĐã xuất kết quả ra thư mục 'reports'.")
+        elif errors:
+            messagebox.showerror("Thông Báo Quét Dữ Liệu Zalo", errors[0])
         else:
             messagebox.showinfo("Kết quả", "Không tìm thấy tin nhắn nào chứa các mã đã chọn.")
 
@@ -288,16 +333,19 @@ class ZaloStockFilterGUI:
         if item_vals and len(item_vals) >= 6:
             detail_win = tk.Toplevel(self.root)
             detail_win.title(f"Chi Tiết Tin Nhắn - [{item_vals[2]}]")
-            detail_win.geometry("550x350")
-            detail_win.minsize(400, 250)
+            detail_win.geometry("560x380")
+            detail_win.minsize(420, 260)
 
             pad = 12
             frame = ttk.Frame(detail_win, padding=pad)
             frame.pack(fill="both", expand=True)
 
             ttk.Label(frame, text=f"Thời gian: {item_vals[1]}", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=2)
+            ttk.Label(frame, text=f"Mã CP: {item_vals[2]}", font=("Segoe UI", 9, "bold"), foreground=self.PRIMARY_COLOR).pack(anchor="w", pady=2)
             ttk.Label(frame, text=f"Người gửi: {item_vals[3]}").pack(anchor="w", pady=2)
             ttk.Label(frame, text=f"Nhóm: {item_vals[4]}").pack(anchor="w", pady=2)
+            if len(item_vals) >= 7 and item_vals[6]:
+                ttk.Label(frame, text=f"File database: {item_vals[6]}", font=("Segoe UI", 8), foreground="#666666").pack(anchor="w", pady=1)
             ttk.Label(frame, text="Nội dung:", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(8, 2))
 
             text_box = tk.Text(frame, wrap="word", font=("Segoe UI", 10), height=8)

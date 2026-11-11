@@ -32,8 +32,9 @@
 - Nhấp đúp chuột vào file **`ZaloStockFilter.exe`**.
 - Giao diện ứng dụng sẽ xuất hiện:
   - Chọn hoặc nhập mã cổ phiếu cần tìm (ví dụ: `CEO`).
+  - Phần mềm tự động dò tìm cơ sở dữ liệu Zalo PC trong `%LOCALAPPDATA%\ZaloPC`. Nếu bạn di chuyển Zalo sang ổ đĩa khác (như `D:\ZaloPC`), hãy bấm nút **"⚙️ Chọn Thư Mục Zalo..."** để chỉ định.
   - Bấm **"🔍 Quét Mã Đang Chọn"** (hoặc **"🚀 Quét Toàn Bộ Danh Sách"**).
-  - Kết quả tin nhắn sẽ hiển thị ngay trên bảng.
+  - Kết quả tin nhắn sẽ hiển thị ngay trên bảng. Nhấp đúp vào dòng tin nhắn bất kỳ để xem toàn bộ nội dung.
   - Bấm **"🌐 Xem Báo Cáo HTML"** hoặc **"📁 Mở Thư Mục Báo Cáo"** để xem và mở file Excel kết quả.
 
 ---

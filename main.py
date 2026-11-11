@@ -1,4 +1,11 @@
+import os
 import sys
+
+# Đảm bảo an toàn khi chạy chế độ windowed không có console trên Windows
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
 def main():
     # Nếu có tham số dòng lệnh thì chạy CLI
@@ -16,7 +23,10 @@ def main():
             launch_gui()
         except Exception as e:
             # Nếu chạy trên môi trường không có GUI (server/headless), tự động chuyển sang CLI
-            print(f"[!] Không thể khởi động giao diện đồ họa ({e}). Đang chuyển sang dòng lệnh...")
+            try:
+                print(f"[!] Không thể khởi động giao diện đồ họa ({e}). Đang chuyển sang dòng lệnh...")
+            except Exception:
+                pass
             from cli import main as cli_main
             cli_main()
 

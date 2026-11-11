@@ -1,7 +1,46 @@
 import sys
 import argparse
 from config_manager import load_config, save_config
-from scanner import scan_messages_for_ticker, export_results
+from scanner import scan_messages_for_ticker, export_results, find_all_sqlite_dbs, get_possible_zalo_dirs
+
+def menu_zalo_dir(config):
+    while True:
+        custom_path = config.get("custom_zalo_path", "").strip()
+        print("\n" + "="*45)
+        print("    CẤU HÌNH THƯ MỤC DỮ LIỆU ZALO PC")
+        print("="*45)
+        if custom_path:
+            print(f"Thư mục hiện tại (Tùy chỉnh): {custom_path}")
+        else:
+            print("Thư mục hiện tại: Tự động phát hiện (%LOCALAPPDATA%\\ZaloPC)")
+
+        # Thử tìm kiếm database với cấu hình hiện tại
+        dbs = find_all_sqlite_dbs()
+        print(f"Trạng thái: Đã phát hiện {len(dbs)} file cơ sở dữ liệu Zalo PC.")
+        if dbs:
+            for idx, db in enumerate(dbs[:3], start=1):
+                print(f"  {idx}. {db}")
+            if len(dbs) > 3:
+                print(f"  ... và {len(dbs) - 3} file khác.")
+
+        print("\nCác tùy chọn:")
+        print("  1. Thiết lập đường dẫn thư mục Zalo mới")
+        print("  2. Đặt lại về tự động phát hiện mặc định")
+        print("  0. Quay lại menu chính")
+
+        opt = input("Nhập lựa chọn: ").strip()
+        if opt == "1":
+            new_path = input("Nhập đường dẫn đầy đủ đến thư mục Zalo PC: ").strip()
+            if new_path:
+                config["custom_zalo_path"] = new_path
+                save_config(config)
+                print(f"[+] Đã lưu đường dẫn: {new_path}")
+        elif opt == "2":
+            config["custom_zalo_path"] = ""
+            save_config(config)
+            print("[+] Đã đặt lại về chế độ tự động phát hiện.")
+        elif opt == "0":
+            break
 
 def menu_watchlist(config):
     while True:
@@ -81,7 +120,7 @@ def run_single_filter(ticker):
 
     results, err = scan_messages_for_ticker(ticker, progress_callback=print_progress)
     if err:
-        print(f"[!] {err}")
+        print(f"\n[!] THÔNG BÁO:\n{err}")
         return
 
     if not results:
@@ -103,6 +142,7 @@ def run_cli_interactive():
         print("2. Quét theo mã nhập tay (tùy chọn lưu lại)")
         print("3. Quét toàn bộ các mã trong danh sách")
         print("4. Quản lý danh sách mã & đổi mã mặc định")
+        print("5. Cấu hình & Kiểm tra thư mục dữ liệu Zalo")
         print("0. Thoát")
         
         choice = input("Nhập thao tác: ").strip()
@@ -135,6 +175,9 @@ def run_cli_interactive():
         elif choice == "4":
             menu_watchlist(config)
 
+        elif choice == "5":
+            menu_zalo_dir(config)
+
         elif choice == "0":
             print("Đã thoát chương trình.")
             break
@@ -144,8 +187,15 @@ def main():
     parser.add_argument("--auto", action="store_true", help="Chạy chế độ tự động cho Task Scheduler (quét mã mặc định hoặc toàn bộ)")
     parser.add_argument("--all", action="store_true", help="Quét toàn bộ danh sách mã theo dõi trong chế độ tự động")
     parser.add_argument("--ticker", type=str, help="Quét trực tiếp một mã cổ phiếu cụ thể")
+    parser.add_argument("--zalo-dir", type=str, help="Chỉ định thư mục dữ liệu Zalo PC")
 
     args = parser.parse_args()
+
+    if args.zalo_dir:
+        cfg = load_config()
+        cfg["custom_zalo_path"] = args.zalo_dir
+        save_config(cfg)
+        print(f"[+] Đã cấu hình thư mục Zalo: {args.zalo_dir}")
 
     if args.ticker:
         run_single_filter(args.ticker)
