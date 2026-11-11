@@ -1,0 +1,15 @@
+{
+    "watchlist": [
+        "CEO",
+        "DIG",
+        "DBC",
+        "HPG",
+        "SSI",
+        "VND"
+    ],
+    "default_ticker": "CEO",
+    "case_sensitive": false,
+    "output_dir": "reports",
+    "export_format": "both",
+    "custom_zalo_path": ""
+}

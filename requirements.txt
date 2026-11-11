@@ -1,0 +1,3 @@
+# Không bắt buộc cài đặt package nào cho runtime (sử dụng 100% Python Standard Library).
+# Chỉ cần pyinstaller nếu bạn muốn tự đóng gói thành file .exe trên máy của mình:
+pyinstaller>=6.0.0
