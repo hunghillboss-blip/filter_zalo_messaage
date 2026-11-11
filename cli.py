@@ -1,7 +1,7 @@
 import sys
 import argparse
 from config_manager import load_config, save_config
-from scanner import scan_messages_for_ticker, export_results, find_all_sqlite_dbs, get_possible_zalo_dirs
+from scanner import scan_messages_for_ticker, export_results, find_all_sqlite_dbs, find_all_zalo_storage_sources, get_possible_zalo_dirs
 
 def menu_zalo_dir(config):
     while True:
@@ -15,13 +15,15 @@ def menu_zalo_dir(config):
             print("Thư mục hiện tại: Tự động phát hiện (%LOCALAPPDATA%\\ZaloPC)")
 
         # Thử tìm kiếm database với cấu hình hiện tại
-        dbs = find_all_sqlite_dbs()
-        print(f"Trạng thái: Đã phát hiện {len(dbs)} file cơ sở dữ liệu Zalo PC.")
-        if dbs:
-            for idx, db in enumerate(dbs[:3], start=1):
+        sql_dbs, lvl_files = find_all_zalo_storage_sources()
+        total_sources = len(sql_dbs) + len(lvl_files)
+        print(f"Trạng thái: Đã phát hiện {total_sources} nguồn dữ liệu Zalo ({len(sql_dbs)} SQLite, {len(lvl_files)} LevelDB/IndexedDB).")
+        if sql_dbs or lvl_files:
+            all_preview = sql_dbs + lvl_files
+            for idx, db in enumerate(all_preview[:3], start=1):
                 print(f"  {idx}. {db}")
-            if len(dbs) > 3:
-                print(f"  ... và {len(dbs) - 3} file khác.")
+            if total_sources > 3:
+                print(f"  ... và {total_sources - 3} file khác.")
 
         print("\nCác tùy chọn:")
         print("  1. Thiết lập đường dẫn thư mục Zalo mới")

@@ -17,6 +17,222 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w", encoding="utf-8")
 
+def decompress_snappy(data):
+    """
+    Giải nén dữ liệu Snappy thuần Python (không phụ thuộc vào thư viện bên ngoài hay C++).
+    Đảm bảo tương thích 100% khi build PyInstaller portable.
+    """
+    if not data:
+        return b""
+    pos = 0
+    length = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        length |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+
+    out = bytearray()
+    while pos < len(data):
+        tag = data[pos]
+        pos += 1
+        elem_type = tag & 0x03
+        if elem_type == 0:  # Literal
+            lit_len = tag >> 2
+            if lit_len < 60:
+                lit_len += 1
+            elif lit_len == 60:
+                if pos >= len(data):
+                    break
+                lit_len = data[pos] + 1
+                pos += 1
+            elif lit_len == 61:
+                if pos + 2 > len(data):
+                    break
+                lit_len = int.from_bytes(data[pos:pos+2], "little") + 1
+                pos += 2
+            elif lit_len == 62:
+                if pos + 3 > len(data):
+                    break
+                lit_len = int.from_bytes(data[pos:pos+3], "little") + 1
+                pos += 3
+            elif lit_len == 63:
+                if pos + 4 > len(data):
+                    break
+                lit_len = int.from_bytes(data[pos:pos+4], "little") + 1
+                pos += 4
+            if pos + lit_len > len(data):
+                out.extend(data[pos:])
+                break
+            out.extend(data[pos:pos+lit_len])
+            pos += lit_len
+        elif elem_type == 1:  # Copy 1-byte offset
+            copy_len = ((tag >> 2) & 7) + 4
+            if pos >= len(data):
+                break
+            offset = ((tag & 0xe0) << 3) | data[pos]
+            pos += 1
+            if offset <= 0:
+                break
+            for _ in range(copy_len):
+                if len(out) >= offset:
+                    out.append(out[-offset])
+        elif elem_type == 2:  # Copy 2-byte offset
+            copy_len = (tag >> 2) + 1
+            if pos + 2 > len(data):
+                break
+            offset = int.from_bytes(data[pos:pos+2], "little")
+            pos += 2
+            if offset <= 0:
+                break
+            for _ in range(copy_len):
+                if len(out) >= offset:
+                    out.append(out[-offset])
+        elif elem_type == 3:  # Copy 4-byte offset
+            copy_len = (tag >> 2) + 1
+            if pos + 4 > len(data):
+                break
+            offset = int.from_bytes(data[pos:pos+4], "little")
+            pos += 4
+            if offset <= 0:
+                break
+            for _ in range(copy_len):
+                if len(out) >= offset:
+                    out.append(out[-offset])
+    return bytes(out)
+
+def read_varint(data, pos):
+    """Đọc số nguyên varint từ buffer data tại vị trí pos."""
+    val = 0
+    shift = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        val |= (b & 0x7f) << shift
+        if not (b & 0x80):
+            break
+        shift += 7
+    return val, pos
+
+LEVELDB_MAGIC = b"\x57\xfb\x80\x8b\x24\x75\x47\xdb"
+
+def is_leveldb_sstable(file_path):
+    """Kiểm tra xem file có phải là SSTable (.ldb) của LevelDB hay không qua 8-byte magic footer."""
+    try:
+        if not os.path.isfile(file_path) or os.path.getsize(file_path) < 48:
+            return False
+        with open(file_path, "rb") as f:
+            f.seek(-8, os.SEEK_END)
+            return f.read(8) == LEVELDB_MAGIC
+    except Exception:
+        return False
+
+def extract_sstable_blocks(data):
+    """Bóc tách và giải nén các Data Blocks từ LevelDB SSTable (.ldb)."""
+    blocks = []
+    if len(data) < 48:
+        return blocks
+    magic = data[-8:]
+    if magic != LEVELDB_MAGIC:
+        return blocks
+
+    pos = len(data) - 48
+    try:
+        meta_off, pos = read_varint(data, pos)
+        meta_sz, pos = read_varint(data, pos)
+        idx_off, pos = read_varint(data, pos)
+        idx_sz, pos = read_varint(data, pos)
+
+        if idx_off + idx_sz > len(data):
+            return blocks
+
+        idx_block_data = data[idx_off : idx_off + idx_sz]
+        comp_type = data[idx_off + idx_sz] if idx_off + idx_sz < len(data) else 0
+        if comp_type == 1:
+            try:
+                idx_block_data = decompress_snappy(idx_block_data)
+            except Exception:
+                pass
+
+        if len(idx_block_data) < 4:
+            return blocks
+
+        num_restarts = int.from_bytes(idx_block_data[-4:], "little")
+        entries_end = len(idx_block_data) - 4 - (4 * num_restarts)
+        if entries_end <= 0:
+            entries_end = len(idx_block_data) - 4
+
+        p = 0
+        while p < entries_end:
+            shared_len, p = read_varint(idx_block_data, p)
+            unshared_len, p = read_varint(idx_block_data, p)
+            val_len, p = read_varint(idx_block_data, p)
+            p += unshared_len
+            val = idx_block_data[p : p + val_len]
+            p += val_len
+
+            if val:
+                b_off, vp = read_varint(val, 0)
+                b_sz, vp = read_varint(val, vp)
+                if 0 <= b_off and b_off + b_sz <= len(data):
+                    b_data = data[b_off : b_off + b_sz]
+                    b_comp = data[b_off + b_sz] if b_off + b_sz < len(data) else 0
+                    if b_comp == 1:
+                        try:
+                            b_data = decompress_snappy(b_data)
+                        except Exception:
+                            pass
+                    blocks.append(b_data)
+    except Exception:
+        pass
+    return blocks
+
+def extract_log_records(data):
+    """Bóc tách các bản ghi từ LevelDB Write-Ahead Log (.log) với block 32KB."""
+    records = []
+    current_record = bytearray()
+    pos = 0
+    BLOCK_SIZE = 32768
+
+    while pos + 7 <= len(data):
+        block_offset = pos % BLOCK_SIZE
+        if BLOCK_SIZE - block_offset < 7:
+            pos += (BLOCK_SIZE - block_offset)
+            continue
+
+        crc = int.from_bytes(data[pos:pos+4], "little")
+        length = int.from_bytes(data[pos+4:pos+6], "little")
+        rec_type = data[pos+6]
+        pos += 7
+
+        if rec_type == 0:  # Zero type / padding
+            if length == 0:
+                pos += (BLOCK_SIZE - (pos % BLOCK_SIZE)) % BLOCK_SIZE
+                continue
+
+        if pos + length > len(data):
+            break
+
+        chunk = data[pos:pos+length]
+        pos += length
+
+        if rec_type == 1:  # Full
+            records.append(bytes(chunk))
+            current_record = bytearray()
+        elif rec_type == 2:  # First
+            current_record = bytearray(chunk)
+        elif rec_type == 3:  # Middle
+            current_record.extend(chunk)
+        elif rec_type == 4:  # Last
+            current_record.extend(chunk)
+            records.append(bytes(current_record))
+            current_record = bytearray()
+
+    return records
+
 def is_sqlite_file(file_path):
     """Kiểm tra xem file có phải là file SQLite hợp lệ hay không (dựa trên 16 bytes magic header)."""
     try:
@@ -102,45 +318,51 @@ def get_possible_zalo_dirs():
 
     return dirs
 
-def find_all_sqlite_dbs(search_dirs=None):
+def find_all_zalo_storage_sources(search_dirs=None):
     """
-    Tìm tất cả các file SQLite có khả năng chứa dữ liệu tin nhắn.
+    Tìm tất cả các file lưu trữ tin nhắn Zalo PC gồm cả SQLite (.db) và IndexedDB / LevelDB (.ldb, .log).
     Duyệt đệ quy và hỗ trợ cả symbolic links/junctions.
+    Trả về tuple: (sqlite_paths, leveldb_paths)
     """
     if search_dirs is None:
         search_dirs = get_possible_zalo_dirs()
 
-    found_dbs = []
+    found_sqlite = []
+    found_leveldb = []
     seen = set()
 
     for s_dir in search_dirs:
         if not os.path.exists(s_dir):
             continue
 
-        # Nếu đường dẫn trỏ trực tiếp đến 1 file database
+        # Nếu đường dẫn trỏ trực tiếp đến 1 file
         if os.path.isfile(s_dir):
-            ext = os.path.splitext(s_dir)[1].lower()
-            if ext in [".db", ".sqlite", ".sqlite3"] or is_sqlite_file(s_dir):
-                abs_f = os.path.abspath(s_dir)
-                if abs_f not in seen:
-                    seen.add(abs_f)
-                    found_dbs.append(abs_f)
+            abs_f = os.path.abspath(s_dir)
+            if abs_f in seen:
+                continue
+            ext = os.path.splitext(abs_f)[1].lower()
+            if (ext in [".db", ".sqlite", ".sqlite3"] or is_sqlite_file(abs_f)) and not is_leveldb_sstable(abs_f):
+                seen.add(abs_f)
+                found_sqlite.append(abs_f)
+            elif ext in [".ldb", ".sst", ".log"] or is_leveldb_sstable(abs_f) or "leveldb" in abs_f.lower() or "indexeddb" in abs_f.lower():
+                seen.add(abs_f)
+                found_leveldb.append(abs_f)
             continue
 
-        # Duyệt thư mục đệ quy (followlinks=True để quét qua junction sang ổ D/E)
         for root, dirs, files in os.walk(s_dir, followlinks=True):
-            # Bỏ qua các thư mục không liên quan để tối ưu tốc độ quét
             dirs[:] = [d for d in dirs if d.lower() not in [
-                "cache", "crashpad", "gpucache", "logs", "temp", "node_modules", ".git", "asset", "blob_storage"
+                "crashpad", "gpucache", "temp", "node_modules", ".git", "asset", "blob_storage", "code cache"
             ]]
+            root_lower = root.lower()
+            is_in_leveldb_dir = ("leveldb" in root_lower or "indexeddb" in root_lower or "storage" in root_lower)
+
             for file in files:
                 lower_file = file.lower()
                 ext = os.path.splitext(lower_file)[1]
 
-                # Bỏ qua các file media, thực thi, log
-                if ext in [".exe", ".dll", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".webp", ".log", ".txt", ".json", ".asar", ".tmp", ".zip"]:
+                # Bỏ qua các file media, thực thi, ảnh, audio
+                if ext in [".exe", ".dll", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".webp", ".asar", ".tmp", ".zip"]:
                     continue
-                # Bỏ qua file phụ trợ WAL/SHM trong danh sách file chính
                 if lower_file.endswith("-wal") or lower_file.endswith("-shm") or lower_file.endswith("-journal"):
                     continue
 
@@ -148,13 +370,32 @@ def find_all_sqlite_dbs(search_dirs=None):
                 if full_path in seen:
                     continue
 
-                # Nhận diện nếu có đuôi db/sqlite hoặc có magic header SQLite 3
+                # 1. Kiểm tra SQLite
                 if ext in [".db", ".sqlite", ".sqlite3"] or is_sqlite_file(full_path):
                     seen.add(full_path)
-                    found_dbs.append(full_path)
+                    found_sqlite.append(full_path)
+                    continue
 
-    # Ưu tiên các file có tên chứa từ khóa gợi ý
-    def score_db(path):
+                # 2. Kiểm tra LevelDB / IndexedDB
+                if ext in [".ldb", ".sst"]:
+                    seen.add(full_path)
+                    found_leveldb.append(full_path)
+                    continue
+
+                if ext == ".log":
+                    stem = os.path.splitext(lower_file)[0]
+                    if stem.isdigit() or is_in_leveldb_dir:
+                        seen.add(full_path)
+                        found_leveldb.append(full_path)
+                        continue
+
+                if is_in_leveldb_dir and (is_leveldb_sstable(full_path) or ext == ""):
+                    if is_leveldb_sstable(full_path):
+                        seen.add(full_path)
+                        found_leveldb.append(full_path)
+
+    # Sắp xếp ưu tiên
+    def score_sqlite(path):
         lower = os.path.basename(path).lower()
         score = 0
         if "message" in lower: score += 12
@@ -163,11 +404,27 @@ def find_all_sqlite_dbs(search_dirs=None):
         if "history" in lower: score += 6
         if "production" in lower: score += 5
         if "sqlite" in lower: score += 4
-        if "main" in lower: score += 3
         return score
 
-    found_dbs.sort(key=score_db, reverse=True)
-    return found_dbs
+    def score_leveldb(path):
+        lower = path.lower()
+        score = 0
+        if "indexeddb" in lower: score += 10
+        if "chat.zalo.me" in lower: score += 8
+        if "file__0" in lower: score += 6
+        if lower.endswith(".ldb"): score += 4
+        if lower.endswith(".log"): score += 2
+        return score
+
+    found_sqlite.sort(key=score_sqlite, reverse=True)
+    found_leveldb.sort(key=score_leveldb, reverse=True)
+
+    return found_sqlite, found_leveldb
+
+def find_all_sqlite_dbs(search_dirs=None):
+    """Giữ lại hàm tìm SQLite để tương thích ngược với các module khác."""
+    sql_dbs, _ = find_all_zalo_storage_sources(search_dirs)
+    return sql_dbs
 
 def format_timestamp(ts):
     """Chuyển đổi timestamp (giây, mili-giây, hoặc micro-giây) sang dạng datetime dễ đọc."""
@@ -434,9 +691,295 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
 
     return results, None
 
+def extract_balanced_json(text, pos, max_lookback=4000, max_lookforward=4000):
+    """
+    Trích xuất khối JSON bao quanh vị trí pos một cách cân bằng và chính xác.
+    Hỗ trợ chuỗi có escape quote, nested objects.
+    """
+    start_search = max(0, pos - max_lookback)
+    end_search = min(len(text), pos + max_lookforward)
+
+    open_indices = [i for i in range(pos - 1, start_search - 1, -1) if text[i] == "{"]
+
+    for start_idx in open_indices:
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start_idx, end_search):
+            c = text[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    escape = True
+                elif c == '"':
+                    in_string = False
+            else:
+                if c == '"':
+                    in_string = True
+                elif c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        if i >= pos:
+                            chunk = text[start_idx:i+1]
+                            try:
+                                return json.loads(chunk)
+                            except Exception:
+                                pass
+                        break
+    return None
+
+def extract_message_from_data(data, ticker_pattern):
+    """
+    Trích xuất các trường content, sender, group, time từ dữ liệu dict của Zalo.
+    """
+    if not isinstance(data, dict):
+        return None
+
+    content = None
+    for k in ["content", "message", "msg", "text", "body", "dMsg", "description", "title", "caption", "raw_text"]:
+        v = data.get(k)
+        if isinstance(v, str) and ticker_pattern.search(v):
+            content = extract_clean_text(v)
+            break
+        elif isinstance(v, dict):
+            for sub_k in ["content", "message", "msg", "text", "title"]:
+                sub_v = v.get(sub_k)
+                if isinstance(sub_v, str) and ticker_pattern.search(sub_v):
+                    content = extract_clean_text(sub_v)
+                    break
+        if content:
+            break
+
+    if not content:
+        for k, v in data.items():
+            if isinstance(v, str) and ticker_pattern.search(v) and 2 <= len(v) <= 3000:
+                content = extract_clean_text(v)
+                break
+
+    if not content:
+        return None
+
+    sender = "Ẩn danh"
+    for k in ["dName", "fromDName", "sender_name", "senderName", "displayName", "display_name", "from_name", "nickname", "sender", "author", "user_name", "username"]:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip() and v != content:
+            sender = v.strip()
+            break
+
+    group = "Cá nhân/Nhóm"
+    for k in ["room", "room_name", "groupName", "group_name", "conv_name", "thread_name", "chat_name", "title", "convName", "threadName"]:
+        v = data.get(k)
+        if isinstance(v, str) and v.strip() and v != content and v != sender and len(v) < 100:
+            group = v.strip()
+            break
+
+    ts = None
+    for k in ["ts", "time", "date", "created_time", "create_time", "sendTime", "send_time", "timestamp", "datetime"]:
+        v = data.get(k)
+        if v is not None:
+            ts = v
+            break
+
+    return {
+        "content": content,
+        "sender": sender,
+        "group": group,
+        "time": format_timestamp(ts)
+    }
+
+def extract_from_raw_window(window, ticker_pattern):
+    """
+    Bóc tách thông tin tin nhắn từ cửa sổ văn bản khi không parse được JSON hoàn chỉnh.
+    """
+    content = None
+    c_m = re.search(r'"(?:content|message|msg|text|body|dMsg|description|title)"\s*:\s*"((?:\\.|[^"\\])+)"', window)
+    if c_m:
+        raw_c = c_m.group(1)
+        try:
+            raw_c = json.loads(f'"{raw_c}"')
+        except Exception:
+            pass
+        if ticker_pattern.search(raw_c):
+            content = extract_clean_text(raw_c)
+
+    if not content:
+        m = ticker_pattern.search(window)
+        if not m:
+            return None
+        start = m.start()
+        s = start
+        while s > 0 and ord(window[s-1]) >= 32 and window[s-1] not in "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0e\x0f":
+            s -= 1
+        e = m.end()
+        while e < len(window) and ord(window[e]) >= 32 and window[e] not in "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0e\x0f":
+            e += 1
+        cand = window[s:e].strip()
+        if len(cand) >= 3 and ticker_pattern.search(cand):
+            content = cand
+
+    if not content or len(content) > 3000:
+        return None
+
+    sender = "Ẩn danh"
+    s_m = re.search(r'"(?:dName|fromDName|sender_name|senderName|displayName|display_name|from_name|author|nickname|sender)"\s*:\s*"((?:\\.|[^"\\])+)"', window)
+    if s_m:
+        raw_s = s_m.group(1)
+        try:
+            raw_s = json.loads(f'"{raw_s}"')
+        except Exception:
+            pass
+        if raw_s and raw_s != content:
+            sender = raw_s.strip()
+
+    group = "Cá nhân/Nhóm"
+    g_m = re.search(r'"(?:room|room_name|groupName|group_name|conv_name|thread_name|chat_name|title)"\s*:\s*"((?:\\.|[^"\\])+)"', window)
+    if g_m:
+        raw_g = g_m.group(1)
+        try:
+            raw_g = json.loads(f'"{raw_g}"')
+        except Exception:
+            pass
+        if raw_g and raw_g != content and raw_g != sender and len(raw_g) < 100:
+            group = raw_g.strip()
+
+    time_val = ""
+    t_m = re.search(r'"(?:ts|created_time|create_time|sendTime|send_time|timestamp|time)"\s*:\s*(\d{10,16})', window)
+    if t_m:
+        time_val = format_timestamp(t_m.group(1))
+
+    return {
+        "content": content,
+        "sender": sender,
+        "group": group,
+        "time": time_val
+    }
+
+def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
+    """
+    Quét một file LevelDB / IndexedDB (.ldb, .sst, .log) để tìm các tin nhắn chứa mã cổ phiếu.
+    Hỗ trợ giải nén Snappy SSTable blocks và WAL 32KB log records.
+    """
+    results = []
+    try:
+        if not os.path.isfile(file_path) or os.path.getsize(file_path) == 0:
+            return results, None
+    except Exception:
+        return results, None
+
+    # Đọc nội dung file an toàn (nếu bị lock thì thử copy sang file tạm)
+    file_bytes = None
+    try:
+        with open(file_path, "rb") as f:
+            file_bytes = f.read()
+    except PermissionError:
+        try:
+            temp_dir = tempfile.gettempdir()
+            temp_copy = os.path.join(temp_dir, f"lvl_scan_{uuid.uuid4().hex[:8]}_{os.path.basename(file_path)}")
+            shutil.copyfile(file_path, temp_copy)
+            with open(temp_copy, "rb") as f:
+                file_bytes = f.read()
+            try:
+                os.remove(temp_copy)
+            except Exception:
+                pass
+        except Exception as e:
+            return results, f"Không thể truy cập file LevelDB {os.path.basename(file_path)}: {e}"
+    except Exception as e:
+        return results, f"Lỗi đọc file LevelDB {os.path.basename(file_path)}: {e}"
+
+    if not file_bytes:
+        return results, None
+
+    flags = 0 if case_sensitive else re.IGNORECASE
+    pattern = re.compile(rf"\b{re.escape(ticker)}\b", flags)
+
+    # Thu thập các đoạn văn bản (text blocks) từ file
+    text_chunks = []
+
+    # 1. Nếu là SSTable (.ldb / .sst), giải mã các Data Blocks
+    ext = os.path.splitext(file_path)[1].lower()
+    is_sstable = is_leveldb_sstable(file_path) or ext in [".ldb", ".sst"]
+
+    if is_sstable:
+        sstable_blocks = extract_sstable_blocks(file_bytes)
+        for block in sstable_blocks:
+            try:
+                text_chunks.append(block.decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+
+    # 2. Nếu là file log (.log), trích xuất các bản ghi 32KB
+    if ext == ".log":
+        log_recs = extract_log_records(file_bytes)
+        for rec in log_recs:
+            try:
+                text_chunks.append(rec.decode("utf-8", errors="ignore"))
+            except Exception:
+                pass
+
+    # 3. Đồng thời luôn decode toàn bộ file bytes thô để không bỏ sót bất kỳ byte nào
+    try:
+        text_chunks.append(file_bytes.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+
+    file_name = os.path.basename(file_path)
+
+    # Quét và bóc tách tin nhắn
+    for text in text_chunks:
+        if not text:
+            continue
+        # Tìm nhanh xem có chứa ticker không trước khi chạy finditer
+        if not pattern.search(text):
+            continue
+
+        for m in pattern.finditer(text):
+            pos = m.start()
+            msg_info = None
+
+            # Thử bóc tách JSON cân bằng
+            json_data = extract_balanced_json(text, pos)
+            if json_data:
+                msg_info = extract_message_from_data(json_data, pattern)
+
+            # Nếu chưa được, thử fallback
+            if not msg_info or not msg_info.get("content"):
+                window = text[max(0, pos - 1500) : min(len(text), pos + 1500)]
+                msg_info = extract_from_raw_window(window, pattern)
+
+            if msg_info and msg_info.get("content") and pattern.search(msg_info["content"]):
+                # Loại trừ trường hợp content chỉ là URL hoặc path
+                c = msg_info["content"].strip()
+                if c.startswith(("http://", "https://")) and " " not in c:
+                    continue
+
+                results.append({
+                    "ticker": ticker.upper(),
+                    "time": msg_info.get("time", ""),
+                    "sender": msg_info.get("sender", "Ẩn danh"),
+                    "group": msg_info.get("group", "Cá nhân/Nhóm"),
+                    "content": c,
+                    "source_table": "IndexedDB / LevelDB",
+                    "source_db": file_name
+                })
+
+    # Khử trùng lặp nội bộ trong cùng 1 file (giữa data block và raw bytes)
+    unique_file_results = []
+    seen = set()
+    for r in results:
+        key = (r.get("time", ""), r.get("sender", ""), r.get("content", "").strip())
+        if key not in seen:
+            seen.add(key)
+            unique_file_results.append(r)
+
+    return unique_file_results, None
+
 def scan_messages_for_ticker(ticker, progress_callback=None):
     """
-    Quét toàn bộ các cơ sở dữ liệu Zalo tìm thấy để lọc tin nhắn chứa ticker.
+    Quét toàn bộ các cơ sở dữ liệu Zalo (cả SQLite và IndexedDB/LevelDB) tìm thấy để lọc tin nhắn chứa ticker.
     Hỗ trợ progress_callback(msg, percent) để cập nhật giao diện.
     """
     ticker = ticker.strip().upper()
@@ -447,31 +990,49 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
     case_sensitive = config.get("case_sensitive", False)
 
     if progress_callback:
-        progress_callback("Đang tìm kiếm thư mục và cơ sở dữ liệu Zalo PC...", 10)
+        progress_callback("Đang tìm kiếm thư mục và cơ sở dữ liệu (SQLite & LevelDB)...", 5)
 
-    db_paths = find_all_sqlite_dbs()
-    if not db_paths:
+    sqlite_dbs, leveldb_files = find_all_zalo_storage_sources()
+    total_files = len(sqlite_dbs) + len(leveldb_files)
+
+    if total_files == 0:
         zalo_dirs = get_possible_zalo_dirs()
         checked_dirs_str = "\n".join(f" - {d}" for d in zalo_dirs) if zalo_dirs else " (Không tìm thấy thư mục nào)"
         return [], (
-            f"Không tìm thấy file cơ sở dữ liệu Zalo PC nào trên máy tính này.\n\n"
+            f"Không tìm thấy file cơ sở dữ liệu Zalo PC nào (SQLite hoặc LevelDB) trên máy tính này.\n\n"
             f"Đã tự động kiểm tra các thư mục:\n{checked_dirs_str}\n\n"
             f"Hướng dẫn khắc phục:\n"
             f"1. Hãy đảm bảo Zalo PC đã được cài đặt và bạn đã đăng nhập tài khoản.\n"
-            f"2. Nếu bạn chuyển Zalo sang ổ khác (như D:\\ZaloPC), hãy nhấn nút '⚙️ Chọn Thư Mục Zalo' để trỏ đến thư mục đó."
+            f"2. Nếu bạn cài hoặc chuyển Zalo sang ổ khác (như D:\\ZaloPC), hãy nhấn nút '⚙️ Chọn Thư Mục Zalo' để trỏ đến thư mục đó."
         )
 
-    total_dbs = len(db_paths)
     all_results = []
     errors = []
+    processed = 0
 
-    for idx, db_path in enumerate(db_paths, start=1):
+    # 1. Quét các file SQLite
+    for db_path in sqlite_dbs:
+        processed += 1
         db_name = os.path.basename(db_path)
-        percent = int(10 + (idx / total_dbs) * 80)
+        percent = int(5 + (processed / total_files) * 85)
         if progress_callback:
-            progress_callback(f"Đang quét file ({idx}/{total_dbs}): {db_name}...", percent)
+            progress_callback(f"Đang quét SQLite ({processed}/{total_files}): {db_name}...", percent)
 
         res, err = inspect_and_filter_db(db_path, ticker, case_sensitive)
+        if res:
+            all_results.extend(res)
+        if err:
+            errors.append(err)
+
+    # 2. Quét các file LevelDB / IndexedDB (.ldb, .log)
+    for lvl_path in leveldb_files:
+        processed += 1
+        lvl_name = os.path.basename(lvl_path)
+        percent = int(5 + (processed / total_files) * 85)
+        if progress_callback:
+            progress_callback(f"Đang quét LevelDB ({processed}/{total_files}): {lvl_name}...", percent)
+
+        res, err = inspect_and_filter_leveldb(lvl_path, ticker, case_sensitive)
         if res:
             all_results.extend(res)
         if err:
@@ -484,7 +1045,8 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
     unique_results = []
     seen_keys = set()
     for item in all_results:
-        key = (item["time"], item["sender"], item["content"])
+        content_clean = item["content"].strip()
+        key = (item["time"], item["sender"], content_clean)
         if key not in seen_keys:
             seen_keys.add(key)
             unique_results.append(item)

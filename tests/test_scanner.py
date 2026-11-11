@@ -14,10 +14,13 @@ from scanner import (
     is_sqlite_file,
     get_possible_zalo_dirs,
     find_all_sqlite_dbs,
+    find_all_zalo_storage_sources,
     format_timestamp,
     extract_clean_text,
     find_best_columns,
     inspect_and_filter_db,
+    inspect_and_filter_leveldb,
+    decompress_snappy,
     scan_messages_for_ticker,
     export_results,
     generate_html_report,
@@ -205,6 +208,131 @@ class TestScanner(unittest.TestCase):
         finally:
             cfg["custom_zalo_path"] = orig_custom
             save_config(cfg)
+
+    def test_decompress_snappy(self):
+        # 1. Literal đơn giản
+        raw_msg = b"Hello Zalo LevelDB"
+        snappy_lit = bytes([len(raw_msg), (len(raw_msg) - 1) << 2]) + raw_msg
+        self.assertEqual(decompress_snappy(snappy_lit), raw_msg)
+
+        # 2. Chuỗi lặp lại kiểm tra copy offset
+        # Chuỗi: "ABCDEABCDE" (10 bytes) -> 5 bytes literal "ABCDE", copy 5 bytes với offset 5
+        snappy_copy = bytes([10, (4 << 2) | 0]) + b"ABCDE" + bytes([((1 << 2) | 1), 5])
+        self.assertEqual(decompress_snappy(snappy_copy), b"ABCDEABCDE")
+
+        # 3. Dữ liệu rỗng
+        self.assertEqual(decompress_snappy(b""), b"")
+
+    def test_inspect_and_filter_leveldb_log(self):
+        # Giả lập file 000003.log của LevelDB chứa tin nhắn JSON Zalo PC giống hệt như ảnh của người dùng
+        log_file = os.path.join(self.test_dir, "000003.log")
+        user_msg = {
+            "msgId": "8234729384",
+            "cliMsgId": "1715000000000",
+            "dName": "Quốc Cường Ichimoku",
+            "content": "vùng cản ngắn hạn của CEO vẫn là 13-13.5 a nhé",
+            "ts": 1715000000000,
+            "room": "Kỹ Thuật Nhóm Bất Động Sản"
+        }
+        json_bytes = json.dumps(user_msg, ensure_ascii=False).encode("utf-8")
+        
+        # Ghi log LevelDB dạng 32KB block
+        import struct
+        record_header = struct.pack("<IHb", 0x12345678, len(json_bytes), 1)
+        with open(log_file, "wb") as f:
+            f.write(record_header + json_bytes)
+
+        # Quét mã CEO
+        results, err = inspect_and_filter_leveldb(log_file, "CEO")
+        self.assertIsNone(err)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["ticker"], "CEO")
+        self.assertEqual(results[0]["sender"], "Quốc Cường Ichimoku")
+        self.assertEqual(results[0]["group"], "Kỹ Thuật Nhóm Bất Động Sản")
+        self.assertIn("vùng cản ngắn hạn của CEO", results[0]["content"])
+        self.assertEqual(results[0]["source_db"], "000003.log")
+        self.assertEqual(results[0]["source_table"], "IndexedDB / LevelDB")
+
+    def test_inspect_and_filter_leveldb_sstable(self):
+        # Tạo file 000005.ldb hợp lệ có footer, index block và data block
+        import struct
+
+        def make_varint(val):
+            buf = bytearray()
+            while True:
+                b = val & 0x7f
+                val >>= 7
+                if val:
+                    buf.append(b | 0x80)
+                else:
+                    buf.append(b)
+                    break
+            return bytes(buf)
+
+        msg_payload = json.dumps({
+            "dName": "Broker Pro",
+            "content": "Khuyến nghị chốt lời CEO giá 14",
+            "ts": 1715000000000,
+            "room": "VIP Đầu Tư"
+        }, ensure_ascii=False).encode("utf-8")
+
+        data_block = msg_payload + struct.pack("<II", 0, 1)
+        data_block_bytes = data_block + b"\x00" + b"\x00\x00\x00\x00"
+
+        val = make_varint(0) + make_varint(len(data_block))
+        index_entry = make_varint(0) + make_varint(3) + make_varint(len(val)) + b"key" + val
+        index_block = index_entry + struct.pack("<II", 0, 1)
+        index_block_bytes = index_block + b"\x00" + b"\x00\x00\x00\x00"
+
+        file_content = data_block_bytes + index_block_bytes
+        idx_off = len(data_block_bytes)
+        idx_sz = len(index_block)
+
+        meta_h = make_varint(0) + make_varint(0)
+        idx_h = make_varint(idx_off) + make_varint(idx_sz)
+        footer_body = meta_h + idx_h
+        padding = b"\x00" * (48 - len(footer_body) - 8)
+        footer = footer_body + padding + b"\x57\xfb\x80\x8b\x24\x75\x47\xdb"
+        file_content += footer
+
+        sstable_file = os.path.join(self.test_dir, "000005.ldb")
+        with open(sstable_file, "wb") as f:
+            f.write(file_content)
+
+        results, err = inspect_and_filter_leveldb(sstable_file, "CEO")
+        self.assertIsNone(err)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["ticker"], "CEO")
+        self.assertEqual(results[0]["sender"], "Broker Pro")
+        self.assertEqual(results[0]["group"], "VIP Đầu Tư")
+        self.assertIn("chốt lời CEO", results[0]["content"])
+
+    def test_find_all_zalo_storage_sources(self):
+        # Tạo cấu trúc thư mục gồm cả SQLite và IndexedDB
+        zalo_root = os.path.join(self.test_dir, "ZaloPC_Test")
+        sqlite_dir = os.path.join(zalo_root, "sqlite", "_production")
+        idb_dir = os.path.join(zalo_root, "123456", "IndexedDB", "file__0.indexeddb.leveldb")
+        os.makedirs(sqlite_dir, exist_ok=True)
+        os.makedirs(idb_dir, exist_ok=True)
+
+        # 1. Tạo SQLite file
+        conn = sqlite3.connect(os.path.join(sqlite_dir, "app.db"))
+        conn.execute("CREATE TABLE t (id INT);")
+        conn.close()
+
+        # 2. Tạo LevelDB files
+        with open(os.path.join(idb_dir, "000001.log"), "wb") as f:
+            f.write(b"LevelDB log test")
+        with open(os.path.join(idb_dir, "000002.ldb"), "wb") as f:
+            f.write(b"\x00" * 40 + b"\x57\xfb\x80\x8b\x24\x75\x47\xdb")
+
+        sql_found, lvl_found = find_all_zalo_storage_sources([zalo_root])
+        self.assertEqual(len(sql_found), 1)
+        self.assertTrue(sql_found[0].endswith("app.db"))
+        self.assertEqual(len(lvl_found), 2)
+        found_basenames = [os.path.basename(f) for f in lvl_found]
+        self.assertIn("000001.log", found_basenames)
+        self.assertIn("000002.ldb", found_basenames)
 
 if __name__ == "__main__":
     unittest.main()

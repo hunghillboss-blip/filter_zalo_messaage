@@ -327,7 +327,7 @@ class ZaloStockFilterGUI:
             ticker_list_str = ", ".join(tickers)
             messagebox.showinfo(
                 "Kết quả Quét", 
-                f"Đã quét các cơ sở dữ liệu Zalo PC nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
+                f"Đã quét các cơ sở dữ liệu Zalo PC (SQLite & IndexedDB LevelDB) nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
                 f"Gợi ý kiểm tra:\n"
                 f"1. Hãy mở Zalo PC và bấm 'Đồng bộ tin nhắn từ điện thoại' để Zalo tải tin nhắn các nhóm về máy tính.\n"
                 f"2. Bạn có thể thử tìm một từ chắc chắn đang có trong tin nhắn gần đây (ví dụ: 'chào', 'alo' hoặc mã cổ phiếu khác đang chat)."

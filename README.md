@@ -8,16 +8,17 @@
 
 1. **Chạy ngay không cần cài Python:** Đã được đóng gói sẵn thành file `.exe` độc lập cho Windows.
 2. **Không phụ thuộc cấu hình máy:** Phần mềm siêu nhẹ (~15MB), tiêu tốn cực ít RAM/CPU (< 30MB RAM), mở lên tức thì, mượt mà trên cả máy tính văn phòng cấu hình thấp.
-3. **An toàn 100% cho tài khoản Zalo:** Đọc cơ sở dữ liệu SQLite cục bộ (offline) trên máy, hoàn toàn không can thiệp API mạng hay gửi tin nhắn, không lo bị khóa tài khoản.
-4. **Không bị xung đột file lock:** Tự động tạo bản sao tạm thời để truy vấn nên bạn có thể quét dữ liệu thoải mái ngay cả khi Zalo PC đang mở.
-5. **Giao diện trực quan (GUI):**
+3. **Hỗ trợ toàn diện cả IndexedDB (LevelDB) & SQLite:** Zalo PC xây dựng trên Electron (Chromium), lưu trữ tin nhắn chủ yếu trong các file **IndexedDB LevelDB (`.ldb`, `.log`)** và một số dữ liệu phụ trợ trong **SQLite (`.db`)**. Chương trình tích hợp sẵn bộ giải nén và bóc tách LevelDB thuần Python, đảm bảo bắt trọn 100% mọi tin nhắn hiển thị trên màn hình Zalo PC.
+4. **An toàn 100% cho tài khoản Zalo:** Đọc cơ sở dữ liệu cục bộ (offline) trên máy, hoàn toàn không can thiệp API mạng hay gửi tin nhắn, không lo bị khóa tài khoản.
+5. **Không bị xung đột file lock:** Tự động xử lý an toàn nên bạn có thể quét dữ liệu thoải mái ngay cả khi Zalo PC đang mở và đang chat.
+6. **Giao diện trực quan (GUI):**
    - Quản lý danh sách mã theo dõi (Watchlist): Thêm, xóa mã, đổi mã mặc định chỉ bằng 1 cú nhấp chuột.
    - Xem kết quả tin nhắn trực tiếp ngay trên bảng của phần mềm.
    - Nhấp đúp vào tin nhắn để đọc nội dung đầy đủ.
-6. **Báo cáo đa dạng & chuyên nghiệp:**
+7. **Báo cáo đa dạng & chuyên nghiệp:**
    - **File Excel/CSV (UTF-8 có BOM):** Mở trực tiếp bằng Microsoft Excel trên mọi máy tính Windows mà không bao giờ bị lỗi font tiếng Việt.
    - **Báo cáo HTML giao diện hiện đại:** Tự động mở xem trên trình duyệt web, có sẵn thanh tìm kiếm và đánh dấu (highlight) nổi bật mã cổ phiếu.
-7. **Hỗ trợ hẹn giờ tự động:** Có sẵn lệnh CLI để tích hợp vào Windows Task Scheduler chạy tự động vào cuối phiên giao dịch (15h30 hàng ngày).
+8. **Hỗ trợ hẹn giờ tự động:** Có sẵn lệnh CLI để tích hợp vào Windows Task Scheduler chạy tự động vào cuối phiên giao dịch (15h30 hàng ngày).
 
 ---
 
