@@ -8,6 +8,7 @@
         "VND"
     ],
     "default_ticker": "CEO",
+    "only_today": true,
     "case_sensitive": false,
     "output_dir": "reports",
     "export_format": "both",

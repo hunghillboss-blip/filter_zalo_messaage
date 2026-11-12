@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 import uuid
-from datetime import datetime
+from datetime import datetime, date
 from config_manager import get_base_dir, load_config
 
 # Đảm bảo stdout/stderr an toàn khi chạy chế độ không có console (windowed)
@@ -567,29 +567,68 @@ def find_all_sqlite_dbs(search_dirs=None):
     sql_dbs, _ = find_all_zalo_storage_sources(search_dirs)
     return sql_dbs
 
-def format_timestamp(ts):
-    """Chuyển đổi timestamp (giây, mili-giây, hoặc micro-giây) sang dạng datetime dễ đọc."""
-    if not ts:
-        return ""
+def parse_message_datetime(ts):
+    """Phân tích giá trị timestamp (số nguyên giây/mili/micro-giây hoặc chuỗi ngày giờ) thành đối tượng datetime."""
+    if ts is None or ts == "":
+        return None
     try:
         if isinstance(ts, (int, float)):
             val = float(ts)
-        else:
-            ts_str = str(ts).strip()
-            if not ts_str.isdigit():
-                return ts_str
+            if val <= 0:
+                return None
+            if val > 1e14:  # Microseconds
+                val = val / 1e6
+            elif val > 1e11:  # Milliseconds
+                val = val / 1e3
+            return datetime.fromtimestamp(val)
+
+        ts_str = str(ts).strip()
+        if not ts_str:
+            return None
+
+        if ts_str.replace(".", "", 1).isdigit():
             val = float(ts_str)
+            if val <= 0:
+                return None
+            if val > 1e14:
+                val = val / 1e6
+            elif val > 1e11:
+                val = val / 1e3
+            return datetime.fromtimestamp(val)
 
-        # Microseconds (> 1e14)
-        if val > 1e14:
-            val = val / 1e6
-        # Milliseconds (> 1e11)
-        elif val > 1e11:
-            val = val / 1e3
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d/%m/%Y",
+        ):
+            try:
+                return datetime.strptime(ts_str, fmt)
+            except ValueError:
+                continue
 
-        return datetime.fromtimestamp(val).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
     except Exception:
-        return str(ts)
+        return None
+
+def format_timestamp(ts):
+    """Chuyển đổi timestamp (giây, mili-giây, hoặc micro-giây) sang dạng datetime dễ đọc."""
+    dt = parse_message_datetime(ts)
+    if dt:
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    return str(ts) if ts else ""
+
+def is_message_on_date(ts, target_date=None):
+    """Kiểm tra xem timestamp của tin nhắn có thuộc ngày target_date (mặc định là hôm nay) hay không."""
+    if target_date is None:
+        target_date = date.today()
+    dt = parse_message_datetime(ts)
+    if not dt:
+        return False
+    return dt.date() == target_date
 
 def extract_clean_text(raw_val):
     """
@@ -689,11 +728,12 @@ def find_best_columns(col_names):
 
     return time_col, sender_col, group_col, content_candidates
 
-def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
+def inspect_and_filter_db(db_path, ticker, case_sensitive=False, only_today=False, target_date=None):
     """
     Quét một file SQLite để tìm các tin nhắn chứa mã cổ phiếu.
     Sử dụng bản sao tạm thời gồm cả file .db, -wal, -shm để không bị khóa file và đọc được dữ liệu mới nhất.
     Hỗ trợ cả UTF-8 và UTF-16LE cho các cột dạng BLOB.
+    Nếu only_today=True, chỉ lấy tin nhắn có mốc thời gian trong ngày hôm nay.
     """
     results = []
     temp_dir = tempfile.gettempdir()
@@ -723,6 +763,7 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
     conn = None
     flags = 0 if case_sensitive else re.IGNORECASE
     pattern = re.compile(rf"\b{re.escape(ticker)}\b", flags)
+    check_date = target_date or date.today()
 
     try:
         conn = sqlite3.connect(temp_file)
@@ -799,6 +840,12 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
 
                     if matched_content:
                         ts_val = row_dict.get(time_col) if time_col else ""
+
+                        # Kiểm tra chỉ quét trong ngày
+                        if only_today:
+                            if not time_col or not is_message_on_date(ts_val, check_date):
+                                continue
+
                         sender_val = row_dict.get(sender_col) if sender_col else "Ẩn danh"
                         group_val = row_dict.get(group_col) if group_col else "Cá nhân/Nhóm"
 
@@ -816,7 +863,7 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False):
 
     except Exception as e:
         # Nếu SQLite query lỗi (ví dụ file bị mã hóa hoặc non-standard), fallback quét nhị phân
-        lvl_res, _ = inspect_and_filter_leveldb(temp_file, ticker, case_sensitive)
+        lvl_res, _ = inspect_and_filter_leveldb(temp_file, ticker, case_sensitive, only_today=only_today, target_date=check_date)
         if lvl_res:
             for r in lvl_res:
                 r["source_db"] = os.path.basename(db_path)
@@ -1008,10 +1055,11 @@ def extract_from_raw_window(window, ticker_pattern):
         "time": time_val
     }
 
-def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
+def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False, only_today=False, target_date=None):
     """
     Quét một file LevelDB / IndexedDB / Data (.ldb, .sst, .log, .dat, .bin) để tìm các tin nhắn chứa mã cổ phiếu.
     Hỗ trợ giải nén Snappy SSTable blocks, WAL 32KB log records, và phân tích đa bảng mã UTF-8 & UTF-16LE.
+    Nếu only_today=True, chỉ lấy tin nhắn có thời gian trong ngày hôm nay.
     """
     results = []
     try:
@@ -1019,6 +1067,18 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
             return results, None
     except Exception:
         return results, None
+
+    check_date = target_date or date.today()
+    # Nếu bật only_today và file là SSTable (.ldb) có mtime cũ trước ngày hôm nay thì bỏ qua vì SSTable là immutable
+    if only_today:
+        try:
+            mtime = os.path.getmtime(file_path)
+            file_mdate = date.fromtimestamp(mtime)
+            ext_lower = os.path.splitext(file_path)[1].lower()
+            if ext_lower in [".ldb", ".sst"] and file_mdate < check_date:
+                return results, None
+        except Exception:
+            pass
 
     # Đọc nội dung file an toàn (nếu bị lock thì thử copy sang file tạm)
     file_bytes = None
@@ -1102,9 +1162,25 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
                 if c.startswith(("http://", "https://")) and " " not in c:
                     continue
 
+                time_val = msg_info.get("time", "")
+
+                # Kiểm tra lọc trong ngày nếu bật only_today
+                if only_today:
+                    if time_val:
+                        if not is_message_on_date(time_val, check_date):
+                            continue
+                    else:
+                        try:
+                            mtime = os.path.getmtime(file_path)
+                            if date.fromtimestamp(mtime) != check_date:
+                                continue
+                            time_val = format_timestamp(mtime)
+                        except Exception:
+                            continue
+
                 results.append({
                     "ticker": ticker.upper(),
-                    "time": msg_info.get("time", ""),
+                    "time": time_val,
                     "sender": msg_info.get("sender", "Ẩn danh"),
                     "group": msg_info.get("group", "Cá nhân/Nhóm"),
                     "content": c,
@@ -1123,11 +1199,12 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False):
 
     return unique_file_results, None
 
-def scan_messages_for_ticker(ticker, progress_callback=None):
+def scan_messages_for_ticker(ticker, progress_callback=None, only_today=None):
     """
     Quét toàn bộ các cơ sở dữ liệu Zalo (cả SQLite và IndexedDB/LevelDB) tìm thấy để lọc tin nhắn chứa ticker.
     Hỗ trợ progress_callback(msg, percent) để cập nhật giao diện.
     Ghi nhận đầy đủ thông tin chẩn đoán (diagnostics) để người dùng có thể kiểm tra.
+    Nếu only_today=None thì lấy từ config (mặc định: True - chỉ quét trong ngày hôm nay).
     """
     global _last_scan_diagnostics
     ticker = ticker.strip().upper()
@@ -1136,9 +1213,13 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
 
     config = load_config()
     case_sensitive = config.get("case_sensitive", False)
+    if only_today is None:
+        only_today = config.get("only_today", True)
+
+    scope_str = f"trong ngày hôm nay ({date.today().strftime('%d/%m/%Y')})" if only_today else "toàn bộ lịch sử"
 
     if progress_callback:
-        progress_callback("Đang tìm kiếm thư mục và cơ sở dữ liệu (SQLite & LevelDB)...", 5)
+        progress_callback(f"Đang tìm kiếm cơ sở dữ liệu Zalo PC (Phạm vi: {scope_str})...", 5)
 
     zalo_dirs = get_possible_zalo_dirs()
     sqlite_dbs, leveldb_files = find_all_zalo_storage_sources(zalo_dirs)
@@ -1150,6 +1231,7 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
         "leveldb_files": [{"path": p, "size": os.path.getsize(p) if os.path.exists(p) else 0} for p in leveldb_files],
         "total_sources": total_files,
         "last_ticker": ticker,
+        "only_today": only_today,
         "results_count": 0,
         "errors": [],
         "summary_text": ""
@@ -1179,7 +1261,7 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
         if progress_callback:
             progress_callback(f"Đang quét SQLite ({processed}/{total_files}): {db_name}...", percent)
 
-        res, err = inspect_and_filter_db(db_path, ticker, case_sensitive)
+        res, err = inspect_and_filter_db(db_path, ticker, case_sensitive=case_sensitive, only_today=only_today)
         if res:
             all_results.extend(res)
         if err:
@@ -1193,7 +1275,7 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
         if progress_callback:
             progress_callback(f"Đang quét LevelDB ({processed}/{total_files}): {lvl_name}...", percent)
 
-        res, err = inspect_and_filter_leveldb(lvl_path, ticker, case_sensitive)
+        res, err = inspect_and_filter_leveldb(lvl_path, ticker, case_sensitive=case_sensitive, only_today=only_today)
         if res:
             all_results.extend(res)
         if err:
@@ -1221,6 +1303,7 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
     summary_lines = [
         f"=== BÁO CÁO CHI TIẾT QUÉT DỮ LIỆU ZALO PC ===",
         f"Mã tìm kiếm: {ticker}",
+        f"Phạm vi thời gian: {scope_str}",
         f"Thời điểm quét: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Tổng số nguồn dữ liệu tìm thấy: {total_files} ({len(sqlite_dbs)} SQLite, {len(leveldb_files)} LevelDB/IndexedDB)",
         f"Tổng số tin nhắn tìm thấy: {len(unique_results)} tin nhắn",
@@ -1241,11 +1324,11 @@ def scan_messages_for_ticker(ticker, progress_callback=None):
     _last_scan_diagnostics["summary_text"] = "\n".join(summary_lines)
 
     if progress_callback:
-        progress_callback(f"Tìm thấy {len(unique_results)} tin nhắn liên quan đến [{ticker}].", 100)
+        progress_callback(f"Tìm thấy {len(unique_results)} tin nhắn [{ticker}] ({scope_str}).", 100)
 
     return unique_results, None
 
-def export_results(results, ticker):
+def export_results(results, ticker, only_today=None):
     """
     Xuất kết quả ra file CSV chuẩn UTF-8-BOM và file HTML báo cáo đẹp mắt.
     Không phụ thuộc vào thư viện bên ngoài.
@@ -1254,6 +1337,9 @@ def export_results(results, ticker):
         return []
 
     config = load_config()
+    if only_today is None:
+        only_today = config.get("only_today", True)
+
     base_dir = get_base_dir()
     out_dir_name = config.get("output_dir", "reports")
     out_dir = os.path.join(base_dir, out_dir_name)
@@ -1288,7 +1374,7 @@ def export_results(results, ticker):
     if export_format in ["html", "both"]:
         html_file = os.path.join(out_dir, f"Zalo_{ticker}_{now_str}.html")
         try:
-            html_content = generate_html_report(results, ticker, now_str)
+            html_content = generate_html_report(results, ticker, now_str, only_today=only_today)
             with open(html_file, "w", encoding="utf-8") as f:
                 f.write(html_content)
             generated_files.append(html_file)
@@ -1297,10 +1383,11 @@ def export_results(results, ticker):
 
     return generated_files
 
-def generate_html_report(results, ticker, now_str):
+def generate_html_report(results, ticker, now_str, only_today=True):
     """Tạo báo cáo giao diện HTML hiện đại, có ô tìm kiếm và giao diện dễ nhìn."""
     rows_html = []
     pattern = re.compile(rf"(\b{re.escape(ticker)}\b)", re.IGNORECASE)
+    scope_label = f"Trong ngày hôm nay ({date.today().strftime('%d/%m/%Y')})" if only_today else "Toàn bộ lịch sử"
 
     for idx, r in enumerate(results, start=1):
         content = r.get("content", "").replace("<", "&lt;").replace(">", "&gt;")
@@ -1341,8 +1428,9 @@ def generate_html_report(results, ticker, now_str):
         .container {{ max-width: 1200px; margin: 0 auto; background: #fff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); padding: 24px; }}
         header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--border); padding-bottom: 16px; margin-bottom: 20px; }}
         h1 {{ font-size: 24px; color: var(--primary); display: flex; align-items: center; gap: 10px; }}
-        .stats {{ display: flex; gap: 16px; font-size: 14px; color: #64748B; }}
+        .stats {{ display: flex; gap: 16px; font-size: 14px; color: #64748B; flex-wrap: wrap; }}
         .badge-count {{ background: var(--primary-light); color: var(--primary); font-weight: bold; padding: 4px 12px; border-radius: 20px; }}
+        .badge-scope {{ background: #ECFDF5; color: #047857; font-weight: 600; padding: 4px 12px; border-radius: 20px; }}
         .badge-ticker {{ background: #FEF08A; color: #854D0E; font-weight: bold; padding: 2px 6px; border-radius: 4px; }}
         .group-tag {{ background: #F1F5F9; color: #475569; padding: 2px 8px; border-radius: 6px; font-size: 12px; }}
         .controls {{ display: flex; gap: 12px; margin-bottom: 16px; }}
@@ -1364,8 +1452,9 @@ def generate_html_report(results, ticker, now_str):
         <header>
             <div>
                 <h1>📊 Tổng Hợp Tin Nhắn Zalo: Mã <span class="badge-ticker">{ticker}</span></h1>
-                <div class="stats" style="margin-top: 6px;">
+                <div class="stats" style="margin-top: 8px;">
                     <span>Xuất lúc: {datetime.now().strftime('%H:%M:%S - %d/%m/%Y')}</span>
+                    <span>Phạm vi lọc: <span class="badge-scope">📅 {scope_label}</span></span>
                     <span>Tổng số tin: <strong class="badge-count">{len(results)} tin nhắn</strong></span>
                 </div>
             </div>

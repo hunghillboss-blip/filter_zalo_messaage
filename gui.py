@@ -3,6 +3,7 @@ import sys
 import subprocess
 import threading
 import webbrowser
+from datetime import date
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -13,7 +14,7 @@ class ZaloStockFilterGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("Bộ Lọc Tin Nhắn Chứng Khoán Zalo PC")
-        self.root.geometry("880x620")
+        self.root.geometry("880x640")
         self.root.minsize(750, 500)
 
         self.config = load_config()
@@ -37,6 +38,7 @@ class ZaloStockFilterGUI:
 
         style.configure("TFrame", background=self.BG_COLOR)
         style.configure("TLabel", background=self.BG_COLOR, font=("Segoe UI", 10))
+        style.configure("TCheckbutton", background=self.BG_COLOR, font=("Segoe UI", 10, "bold"), foreground="#0F5132")
         style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"), foreground=self.PRIMARY_COLOR)
         style.configure("SubHeader.TLabel", font=("Segoe UI", 9), foreground="#666666")
         
@@ -81,7 +83,28 @@ class ZaloStockFilterGUI:
         self.lbl_default_info = ttk.Label(r1_frame, text="", font=("Segoe UI", 9, "italic"), foreground="#008800")
         self.lbl_default_info.pack(side="left", padx=10)
 
-        # Hàng 2: Nút hành động quét
+        # Hàng 2: Tùy chọn lọc chỉ trong ngày hôm nay
+        r_filter_frame = ttk.Frame(control_frame)
+        r_filter_frame.pack(fill="x", pady=(6, 2))
+
+        today_str = date.today().strftime("%d/%m/%Y")
+        self.var_only_today = tk.BooleanVar(value=self.config.get("only_today", True))
+        self.chk_only_today = ttk.Checkbutton(
+            r_filter_frame,
+            text=f"📅 Chỉ quét tin nhắn trong ngày hôm nay ({today_str})",
+            variable=self.var_only_today,
+            command=self._on_toggle_only_today
+        )
+        self.chk_only_today.pack(side="left")
+
+        ttk.Label(
+            r_filter_frame,
+            text="(Bỏ tích nếu muốn quét toàn bộ lịch sử tin nhắn cũ)",
+            font=("Segoe UI", 9, "italic"),
+            foreground="#666666"
+        ).pack(side="left", padx=8)
+
+        # Hàng 3: Nút hành động quét
         r2_frame = ttk.Frame(control_frame)
         r2_frame.pack(fill="x", pady=(8, 2))
 
@@ -100,7 +123,7 @@ class ZaloStockFilterGUI:
         self.btn_diag = ttk.Button(r2_frame, text="📋 Chi Tiết Quét", command=self._on_show_diagnostics)
         self.btn_diag.pack(side="right", padx=5)
 
-        # Hàng 3: Cấu hình thư mục Zalo PC
+        # Hàng 4: Cấu hình thư mục Zalo PC
         r3_frame = ttk.Frame(control_frame)
         r3_frame.pack(fill="x", pady=(8, 2))
 
@@ -244,11 +267,17 @@ class ZaloStockFilterGUI:
         self._refresh_watchlist_ui()
         messagebox.showinfo("Thành công", f"Đã đặt [{ticker}] làm mã mặc định.")
 
+    def _on_toggle_only_today(self):
+        val = bool(self.var_only_today.get())
+        self.config["only_today"] = val
+        save_config(self.config)
+
     def _set_ui_state(self, is_running):
         self.is_scanning = is_running
         state = "disabled" if is_running else "normal"
         self.btn_scan_one.config(state=state)
         self.btn_scan_all.config(state=state)
+        self.chk_only_today.config(state=state)
 
     def _update_progress(self, text, percent):
         self.root.after(0, lambda: self._do_update_progress(text, percent))
@@ -263,7 +292,8 @@ class ZaloStockFilterGUI:
             messagebox.showwarning("Nhắc nhở", "Vui lòng chọn hoặc nhập mã cổ phiếu cần quét.")
             return
 
-        threading.Thread(target=self._scan_thread_worker, args=([ticker],), daemon=True).start()
+        only_today = bool(self.var_only_today.get())
+        threading.Thread(target=self._scan_thread_worker, args=([ticker], only_today), daemon=True).start()
 
     def _on_scan_all(self):
         watchlist = self.config.get("watchlist", [])
@@ -271,9 +301,10 @@ class ZaloStockFilterGUI:
             messagebox.showwarning("Nhắc nhở", "Danh sách rỗng! Hãy thêm mã cổ phiếu trước.")
             return
 
-        threading.Thread(target=self._scan_thread_worker, args=(watchlist,), daemon=True).start()
+        only_today = bool(self.var_only_today.get())
+        threading.Thread(target=self._scan_thread_worker, args=(watchlist, only_today), daemon=True).start()
 
-    def _scan_thread_worker(self, tickers):
+    def _scan_thread_worker(self, tickers, only_today):
         self.root.after(0, lambda: self._set_ui_state(True))
         all_results = []
         exported_all = []
@@ -285,17 +316,17 @@ class ZaloStockFilterGUI:
                 scaled = int(((idx - 1) + (pct / 100)) / len(tickers) * 100)
                 self._update_progress(f"[{ticker}] {msg}", scaled)
 
-            res, err = scan_messages_for_ticker(ticker, progress_callback=prog)
+            res, err = scan_messages_for_ticker(ticker, progress_callback=prog, only_today=only_today)
             if res:
                 all_results.extend(res)
-                files = export_results(res, ticker)
+                files = export_results(res, ticker, only_today=only_today)
                 exported_all.extend(files)
             if err:
                 errors.append(err)
 
-        self.root.after(0, lambda: self._scan_finished(all_results, exported_all, tickers, errors))
+        self.root.after(0, lambda: self._scan_finished(all_results, exported_all, tickers, only_today, errors))
 
-    def _scan_finished(self, results, exported_files, tickers, errors=None):
+    def _scan_finished(self, results, exported_files, tickers, only_today, errors=None):
         self._set_ui_state(False)
         self.current_results = results
         self.last_exported_files = exported_files
@@ -319,11 +350,12 @@ class ZaloStockFilterGUI:
         if exported_files:
             self.btn_open_last.config(state="normal")
 
-        msg = f"Quét hoàn tất: Tìm thấy {len(results)} tin nhắn cho {len(tickers)} mã."
+        scope_str = f"trong ngày hôm nay ({date.today().strftime('%d/%m/%Y')})" if only_today else "toàn bộ lịch sử"
+        msg = f"Quét hoàn tất ({scope_str}): Tìm thấy {len(results)} tin nhắn cho {len(tickers)} mã."
         self._do_update_progress(msg, 100)
 
         if results:
-            messagebox.showinfo("Hoàn Tất", f"Đã tìm thấy {len(results)} tin nhắn!\nĐã xuất kết quả ra thư mục 'reports'.")
+            messagebox.showinfo("Hoàn Tất", f"Đã tìm thấy {len(results)} tin nhắn ({scope_str})!\nĐã xuất kết quả ra thư mục 'reports'.")
         elif errors:
             messagebox.showerror("Thông Báo Quét Dữ Liệu Zalo", errors[0])
         else:
@@ -332,11 +364,11 @@ class ZaloStockFilterGUI:
             total_src = diag.get("total_sources", 0)
             messagebox.showinfo(
                 "Kết quả Quét", 
-                f"Đã quét qua {total_src} file cơ sở dữ liệu Zalo PC (SQLite & LevelDB/IndexedDB) nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
+                f"Đã quét qua {total_src} file cơ sở dữ liệu Zalo PC ({scope_str}) nhưng không có tin nhắn nào chứa mã [{ticker_list_str}].\n\n"
                 f"Gợi ý kiểm tra:\n"
                 f"1. Nhấn nút '📋 Chi Tiết Quét' trên giao diện để xem danh sách file và thư mục đã quét.\n"
-                f"2. Hãy mở Zalo PC và bấm 'Đồng bộ tin nhắn từ điện thoại' để Zalo tải tin nhắn các nhóm về máy tính.\n"
-                f"3. Bạn có thể thử tìm một từ chắc chắn đang có trong tin nhắn gần đây (ví dụ: 'chào', 'alo' hoặc mã cổ phiếu khác đang chat).\n"
+                f"2. Nếu muốn tìm tin nhắn cũ của những ngày trước, hãy BỎ TÍCH ô '📅 Chỉ quét tin nhắn trong ngày hôm nay'.\n"
+                f"3. Hãy mở Zalo PC và bấm 'Đồng bộ tin nhắn từ điện thoại' để Zalo tải tin nhắn các nhóm về máy tính.\n"
                 f"4. Nếu bạn lưu dữ liệu Zalo ở ổ đĩa khác (như D:\\ZaloPC), hãy nhấn nút '⚙️ Chọn Thư Mục...'."
             )
 

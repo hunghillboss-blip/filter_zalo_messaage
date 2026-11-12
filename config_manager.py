@@ -7,6 +7,7 @@ CONFIG_FILE = "config.json"
 DEFAULT_CONFIG = {
     "watchlist": ["CEO", "DIG", "DBC", "HPG", "SSI", "VND"],
     "default_ticker": "CEO",
+    "only_today": True,
     "case_sensitive": False,
     "output_dir": "reports",
     "export_format": "both", # "csv", "html", or "both"

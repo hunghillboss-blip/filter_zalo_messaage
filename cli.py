@@ -1,5 +1,6 @@
 import sys
 import argparse
+from datetime import date
 from config_manager import load_config, save_config
 from scanner import (
     scan_messages_for_ticker,
@@ -136,22 +137,25 @@ def print_diagnostics():
             print(f"  * {d}")
         print(f"Tổng số nguồn dữ liệu: {len(sql) + len(lvl)} ({len(sql)} SQLite, {len(lvl)} LevelDB/IndexedDB)")
 
-def run_single_filter(ticker):
-    print(f"\n[*] Đang quét tin nhắn cho mã [{ticker}]...")
+def run_single_filter(ticker, only_today=None):
+    if only_today is None:
+        only_today = load_config().get("only_today", True)
+    scope_str = f"trong ngày hôm nay ({date.today().strftime('%d/%m/%Y')})" if only_today else "toàn bộ lịch sử"
+    print(f"\n[*] Đang quét tin nhắn cho mã [{ticker}] (Phạm vi: {scope_str})...")
     def print_progress(msg, pct):
         print(f"    [{pct}%] {msg}")
 
-    results, err = scan_messages_for_ticker(ticker, progress_callback=print_progress)
+    results, err = scan_messages_for_ticker(ticker, progress_callback=print_progress, only_today=only_today)
     if err:
         print(f"\n[!] THÔNG BÁO:\n{err}")
         return
 
     if not results:
         diag = get_last_scan_diagnostics()
-        print(f"[-] Không có tin nhắn nào nhắc tới mã [{ticker}]. (Đã quét {diag.get('total_sources', 0)} file dữ liệu)")
+        print(f"[-] Không có tin nhắn nào nhắc tới mã [{ticker}] ({scope_str}). (Đã quét {diag.get('total_sources', 0)} file dữ liệu)")
     else:
-        files = export_results(results, ticker)
-        print(f"[+] Tìm thấy {len(results)} tin nhắn liên quan đến [{ticker}].")
+        files = export_results(results, ticker, only_today=only_today)
+        print(f"[+] Tìm thấy {len(results)} tin nhắn liên quan đến [{ticker}] ({scope_str}).")
         for f in files:
             print(f"    -> Đã xuất: {f}")
 
@@ -159,22 +163,25 @@ def run_cli_interactive():
     config = load_config()
     while True:
         default_ticker = config.get("default_ticker", "CEO")
-        print("\n" + "="*45)
+        only_today = config.get("only_today", True)
+        today_status = f"BẬT - Chỉ ngày {date.today().strftime('%d/%m/%Y')}" if only_today else "TẮT - Quét toàn bộ lịch sử"
+        print("\n" + "="*50)
         print("    CÔNG CỤ LỌC TIN NHẮN CHỨNG KHOÁN ZALO")
-        print("="*45)
+        print("="*50)
         print(f"1. Quét nhanh theo mã mặc định [{default_ticker}]")
         print("2. Quét theo mã nhập tay (tùy chọn lưu lại)")
         print("3. Quét toàn bộ các mã trong danh sách")
         print("4. Quản lý danh sách mã & đổi mã mặc định")
-        print("5. Cấu hình & Kiểm tra thư mục dữ liệu Zalo")
-        print("6. Xem báo cáo chi tiết các file đã quét (Diagnostics)")
+        print(f"5. Đổi chế độ lọc trong ngày (Hiện tại: [{today_status}])")
+        print("6. Cấu hình & Kiểm tra thư mục dữ liệu Zalo")
+        print("7. Xem báo cáo chi tiết các file đã quét (Diagnostics)")
         print("0. Thoát")
         
         choice = input("Nhập thao tác: ").strip()
         
         if choice == "1":
             if default_ticker:
-                run_single_filter(default_ticker)
+                run_single_filter(default_ticker, only_today=only_today)
             else:
                 print("[!] Chưa thiết lập mã mặc định. Hãy chọn mục 4 để thiết lập.")
                 
@@ -187,7 +194,7 @@ def run_cli_interactive():
                         config["watchlist"].append(ticker)
                         save_config(config)
                         print(f"[+] Đã lưu [{ticker}] vào danh sách.")
-                run_single_filter(ticker)
+                run_single_filter(ticker, only_today=only_today)
                 
         elif choice == "3":
             watchlist = config.get("watchlist", [])
@@ -195,15 +202,21 @@ def run_cli_interactive():
                 print("[!] Danh sách rỗng. Hãy thêm mã vào danh sách trước.")
             else:
                 for t in watchlist:
-                    run_single_filter(t)
+                    run_single_filter(t, only_today=only_today)
 
         elif choice == "4":
             menu_watchlist(config)
 
         elif choice == "5":
-            menu_zalo_dir(config)
+            config["only_today"] = not only_today
+            save_config(config)
+            new_state = "Chỉ quét trong ngày hôm nay" if config["only_today"] else "Quét toàn bộ lịch sử"
+            print(f"[+] Đã chuyển sang chế độ: {new_state}")
 
         elif choice == "6":
+            menu_zalo_dir(config)
+
+        elif choice == "7":
             print_diagnostics()
 
         elif choice == "0":
@@ -215,31 +228,38 @@ def main():
     parser.add_argument("--auto", action="store_true", help="Chạy chế độ tự động cho Task Scheduler (quét mã mặc định hoặc toàn bộ)")
     parser.add_argument("--all", action="store_true", help="Quét toàn bộ danh sách mã theo dõi trong chế độ tự động")
     parser.add_argument("--ticker", type=str, help="Quét trực tiếp một mã cổ phiếu cụ thể")
+    parser.add_argument("--today", action="store_true", help="Chỉ lọc tin nhắn trong ngày hôm nay")
+    parser.add_argument("--all-time", action="store_true", help="Lọc toàn bộ lịch sử tin nhắn (không giới hạn ngày)")
     parser.add_argument("--zalo-dir", type=str, help="Chỉ định thư mục dữ liệu Zalo PC")
     parser.add_argument("--diag", action="store_true", help="Hiển thị thông tin chẩn đoán các file dữ liệu Zalo tìm thấy")
 
     args = parser.parse_args()
+    config = load_config()
 
     if args.zalo_dir:
-        cfg = load_config()
-        cfg["custom_zalo_path"] = args.zalo_dir
-        save_config(cfg)
+        config["custom_zalo_path"] = args.zalo_dir
+        save_config(config)
         print(f"[+] Đã cấu hình thư mục Zalo: {args.zalo_dir}")
 
     if args.diag:
         print_diagnostics()
         return
 
+    only_today = config.get("only_today", True)
+    if args.today:
+        only_today = True
+    elif args.all_time:
+        only_today = False
+
     if args.ticker:
-        run_single_filter(args.ticker)
+        run_single_filter(args.ticker, only_today=only_today)
     elif args.auto:
-        config = load_config()
         if args.all:
             for t in config.get("watchlist", []):
-                run_single_filter(t)
+                run_single_filter(t, only_today=only_today)
         else:
             default_t = config.get("default_ticker", "CEO")
-            run_single_filter(default_t)
+            run_single_filter(default_t, only_today=only_today)
     else:
         run_cli_interactive()
 

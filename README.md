@@ -11,7 +11,8 @@
 3. **Hỗ trợ toàn diện cả IndexedDB (LevelDB) & SQLite:** Zalo PC xây dựng trên Electron (Chromium), lưu trữ tin nhắn chủ yếu trong các file **IndexedDB LevelDB (`.ldb`, `.log`)** và một số dữ liệu phụ trợ trong **SQLite (`.db`)**. Chương trình tích hợp sẵn bộ giải nén và bóc tách LevelDB thuần Python, đảm bảo bắt trọn 100% mọi tin nhắn hiển thị trên màn hình Zalo PC.
 4. **An toàn 100% cho tài khoản Zalo:** Đọc cơ sở dữ liệu cục bộ (offline) trên máy, hoàn toàn không can thiệp API mạng hay gửi tin nhắn, không lo bị khóa tài khoản.
 5. **Không bị xung đột file lock:** Tự động xử lý an toàn nên bạn có thể quét dữ liệu thoải mái ngay cả khi Zalo PC đang mở và đang chat.
-6. **Giao diện trực quan (GUI):**
+6. **Giao diện trực quan (GUI) & Lọc tin nhắn TRONG NGÀY:**
+   - Tích hợp sẵn tùy chọn **"📅 Chỉ quét tin nhắn trong ngày hôm nay"** (mặc định được bật sẵn) giúp lọc đúng các tin nhắn nóng hổi của phiên giao dịch hôm đó, không bị lẫn tin cũ từ những ngày trước.
    - Quản lý danh sách mã theo dõi (Watchlist): Thêm, xóa mã, đổi mã mặc định chỉ bằng 1 cú nhấp chuột.
    - Xem kết quả tin nhắn trực tiếp ngay trên bảng của phần mềm.
    - Nhấp đúp vào tin nhắn để đọc nội dung đầy đủ.
@@ -33,6 +34,7 @@
 - Nhấp đúp chuột vào file **`ZaloStockFilter.exe`**.
 - Giao diện ứng dụng sẽ xuất hiện:
   - Chọn hoặc nhập mã cổ phiếu cần tìm (ví dụ: `CEO`).
+  - Ô **"📅 Chỉ quét tin nhắn trong ngày hôm nay"** được tích sẵn (bỏ tích nếu bạn muốn tìm lại tin nhắn của các ngày cũ).
   - Phần mềm tự động dò tìm cơ sở dữ liệu Zalo PC trong `%LOCALAPPDATA%\ZaloPC`. Nếu bạn di chuyển Zalo sang ổ đĩa khác (như `D:\ZaloPC`), hãy bấm nút **"⚙️ Chọn Thư Mục Zalo..."** để chỉ định.
   - Bấm **"🔍 Quét Mã Đang Chọn"** (hoặc **"🚀 Quét Toàn Bộ Danh Sách"**).
   - Kết quả tin nhắn sẽ hiển thị ngay trên bảng. Nhấp đúp vào dòng tin nhắn bất kỳ để xem toàn bộ nội dung.
@@ -50,7 +52,7 @@ Nếu bạn muốn chương trình tự động chạy ngầm vào 15:30 mỗi n
 4. Chọn **Daily** (Hàng ngày) -> Đặt giờ: **15:30:00** -> Bấm **Next**.
 5. Chọn **Start a program** -> Bấm **Next**.
 6. Tại ô **Program/script**: Bấm *Browse* chọn đường dẫn đến file `ZaloStockFilter.exe`.
-7. Tại ô **Add arguments (optional)**: Nhập `--auto` (hoặc `--auto --all` nếu muốn quét hết các mã trong danh sách).
+7. Tại ô **Add arguments (optional)**: Nhập `--auto --today` (hoặc `--auto --all --today` nếu muốn quét hết các mã trong danh sách trong ngày hôm nay).
 8. Bấm **Next** -> Bấm **Finish**.
 
 Từ nay, cứ 15h30 mỗi ngày, chương trình sẽ tự động quét ngầm và xuất file Excel/HTML vào thư mục `reports/` cho bạn.
@@ -72,6 +74,7 @@ Chương trình sẽ tự động tạo file `config.json` nằm cùng thư mụ
         "VND"
     ],
     "default_ticker": "CEO",
+    "only_today": true,
     "case_sensitive": false,
     "output_dir": "reports",
     "export_format": "both",
@@ -81,6 +84,7 @@ Chương trình sẽ tự động tạo file `config.json` nằm cùng thư mụ
 
 - `watchlist`: Danh sách mã cổ phiếu đang theo dõi.
 - `default_ticker`: Mã ưu tiên mặc định.
+- `only_today`: `true` để chỉ lọc tin nhắn trong ngày hôm nay, `false` để quét toàn bộ lịch sử.
 - `case_sensitive`: Phân biệt chữ hoa / chữ thường (`false` là bắt cả `ceo` lẫn `CEO`).
 - `output_dir`: Tên thư mục chứa báo cáo xuất ra.
 - `export_format`: Định dạng xuất (`both`: cả CSV và HTML; hoặc `csv`, `html`).
