@@ -351,6 +351,55 @@ def clean_surrounding_garbage(text):
     text = re.sub(r"[\u2200-\ufffd\x00-\x1f]+$", "", text)
     return text.strip()
 
+def is_valid_human_message(text, ticker):
+    """
+    Kiểm tra xem một chuỗi có thực sự là tin nhắn văn bản của người dùng hay không,
+    loại bỏ 100% rác nhị phân (binary noise, hash, byte ngẫu nhiên như '5M:cEO;yPqR', 'J[CeO').
+    """
+    if not text or not isinstance(text, str):
+        return False
+    text = text.strip()
+    if len(text) < 2 or len(text) > 3000:
+        return False
+
+    ticker_upper = ticker.upper()
+    ticker_lower = ticker.lower()
+
+    # 1. Mã cổ phiếu phải xuất hiện độc lập, viết hoa chuẩn ('CEO') hoặc viết thường ('ceo')
+    # TUYỆT ĐỐI KHÔNG chấp nhận các dạng hoa thường lộn xộn ở giữa từ như: 'cEO', 'CeO', 'CEo'
+    p_exact_case = re.compile(rf"(?:^|[^\w])({re.escape(ticker_upper)}|{re.escape(ticker_lower)})(?=[^\w]|$)")
+    if not p_exact_case.search(text):
+        return False
+
+    # 2. Không được chứa các ký tự điều khiển ẩn (null byte, form feed, escape...)
+    for c in text:
+        code = ord(c)
+        if code < 32 and c not in "\r\n\t":
+            return False
+
+    # 3. Tỷ lệ ký tự chữ/số/dấu tiếng Việt/khoảng trắng so với ký tự đặc biệt lạ
+    valid_chars = 0
+    for c in text:
+        if c.isalnum() or c.isspace() or c in ".,!?:;\"'()[]{}/-+%*=_~–—#@&":
+            valid_chars += 1
+    if (valid_chars / len(text)) < 0.82:
+        return False
+
+    # 4. Nếu chuỗi ngắn (dưới 15 ký tự):
+    # Không thể dính các ký tự punctuation kỳ quặc như 'J[CeO', '.cEO', '?cEO', 'h?%CEO', 'mb1=^ceo'
+    if len(text) < 15:
+        words = text.split()
+        if len(words) <= 1:
+            clean_word = re.sub(r"^[^\w]+|[^\w]+$", "", text)
+            if clean_word.upper() != ticker_upper:
+                return False
+
+    # 5. Nếu chuỗi dài (>= 20 ký tự): tin nhắn đàng hoàng phải có ít nhất 1 khoảng trắng
+    if len(text) >= 20 and " " not in text:
+        return False
+
+    return True
+
 def get_possible_zalo_dirs():
     """
     Tìm tất cả các thư mục có khả năng lưu trữ dữ liệu Zalo PC trên máy tính.
@@ -482,11 +531,14 @@ def find_all_zalo_storage_sources(search_dirs=None, only_today=False, target_dat
             continue
 
         for root, dirs, files in os.walk(s_dir, followlinks=True):
-            dirs[:] = [d for d in dirs if d.lower() not in [
-                "crashpad", "gpucache", "temp", "node_modules", ".git", "asset", "blob_storage", "code cache"
-            ]]
+            skip_dirs = [
+                "cache", "cache_data", "gpucache", "dawncache", "shadercache", "grshadercache",
+                "crashpad", "temp", "node_modules", ".git", "asset", "blob_storage", "code cache",
+                "session storage", "webrtc_event_logs", "databases"
+            ]
+            dirs[:] = [d for d in dirs if not any(sd in d.lower() for sd in skip_dirs)]
             root_lower = root.lower()
-            is_in_data_dir = any(k in root_lower for k in ["leveldb", "indexeddb", "storage", "sqlite", "zalopc", "zaloapp", "zalodata"])
+            is_in_data_dir = any(k in root_lower for k in ["leveldb", "indexeddb", "sqlite"])
 
             for file in files:
                 lower_file = file.lower()
@@ -496,10 +548,14 @@ def find_all_zalo_storage_sources(search_dirs=None, only_today=False, target_dat
                 if ext in [
                     ".exe", ".dll", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mp3", ".wav", ".ico",
                     ".webp", ".asar", ".zip", ".7z", ".rar", ".tmp", ".pak", ".node", ".json", ".css",
-                    ".html", ".js", ".map", ".svg", ".ttf", ".woff", ".woff2"
+                    ".html", ".js", ".map", ".svg", ".ttf", ".woff", ".woff2", ".dat", ".bin"
                 ]:
                     continue
                 if lower_file.endswith("-wal") or lower_file.endswith("-shm") or lower_file.endswith("-journal") or lower_file in ["lock", "log.old"]:
+                    continue
+
+                # Bỏ qua các file cache không extension (như g559945..., f_000...)
+                if ext == "" and not lower_file.startswith("current"):
                     continue
 
                 full_path = os.path.abspath(os.path.join(root, file))
@@ -535,7 +591,7 @@ def find_all_zalo_storage_sources(search_dirs=None, only_today=False, target_dat
                     found_sqlite.append(full_path)
                     continue
 
-                # 2. Kiểm tra LevelDB / IndexedDB / Data files
+                # 2. Kiểm tra LevelDB / IndexedDB (.ldb, .sst, .log)
                 if ext in [".ldb", ".sst"]:
                     seen.add(full_path)
                     found_leveldb.append(full_path)
@@ -547,10 +603,6 @@ def find_all_zalo_storage_sources(search_dirs=None, only_today=False, target_dat
                         seen.add(full_path)
                         found_leveldb.append(full_path)
                         continue
-
-                if is_in_data_dir or ext in [".dat", ".bin", ".data"] or ext == "" or is_leveldb_sstable(full_path):
-                    seen.add(full_path)
-                    found_leveldb.append(full_path)
 
     # Sắp xếp ưu tiên
     def score_sqlite(path):
@@ -857,6 +909,9 @@ def inspect_and_filter_db(db_path, ticker, case_sensitive=False, only_today=Fals
                                 break
 
                     if matched_content:
+                        if not is_valid_human_message(matched_content, ticker):
+                            continue
+
                         ts_val = row_dict.get(time_col) if time_col else ""
 
                         # Kiểm tra chỉ quét trong ngày
@@ -942,9 +997,10 @@ def extract_balanced_json(text, pos, max_lookback=800, max_lookforward=1200):
                         break
     return None
 
-def extract_message_from_data(data, ticker_pattern):
+def extract_message_from_data(data, ticker_pattern, ticker):
     """
     Trích xuất các trường content, sender, group, time từ dữ liệu dict của Zalo.
+    Bắt buộc phải thỏa mãn is_valid_human_message để loại trừ rác nhị phân.
     """
     if not isinstance(data, dict):
         return None
@@ -953,24 +1009,30 @@ def extract_message_from_data(data, ticker_pattern):
     for k in ["content", "message", "msg", "text", "body", "dMsg", "description", "title", "caption", "subTitle", "desc", "raw_text"]:
         v = data.get(k)
         if isinstance(v, str) and ticker_pattern.search(v):
-            content = extract_clean_text(v)
-            break
+            clean_v = extract_clean_text(v)
+            if is_valid_human_message(clean_v, ticker):
+                content = clean_v
+                break
         elif isinstance(v, dict):
             for sub_k in ["content", "message", "msg", "text", "title"]:
                 sub_v = v.get(sub_k)
                 if isinstance(sub_v, str) and ticker_pattern.search(sub_v):
-                    content = extract_clean_text(sub_v)
-                    break
+                    clean_sub = extract_clean_text(sub_v)
+                    if is_valid_human_message(clean_sub, ticker):
+                        content = clean_sub
+                        break
         if content:
             break
 
     if not content:
         for k, v in data.items():
             if isinstance(v, str) and ticker_pattern.search(v) and 2 <= len(v) <= 3000:
-                content = extract_clean_text(v)
-                break
+                clean_v = extract_clean_text(v)
+                if is_valid_human_message(clean_v, ticker):
+                    content = clean_v
+                    break
 
-    if not content:
+    if not content or not is_valid_human_message(content, ticker):
         return None
 
     sender = "Ẩn danh"
@@ -1001,10 +1063,10 @@ def extract_message_from_data(data, ticker_pattern):
         "time": format_timestamp(ts)
     }
 
-def extract_from_raw_window(window, ticker_pattern):
+def extract_from_raw_window(window, ticker_pattern, ticker):
     """
     Bóc tách thông tin tin nhắn từ cửa sổ văn bản khi không parse được JSON hoàn chỉnh.
-    Hỗ trợ xử lý sạch sẽ các ký tự thừa do chuyển đổi UTF-16LE.
+    Chỉ chấp nhận các câu văn hợp lệ cho con người đọc được.
     """
     content = None
     c_m = re.search(r'"(?:content|message|msg|text|body|dMsg|description|title)"\s*:\s*"((?:\\.|[^"\\])+)"', window)
@@ -1015,7 +1077,9 @@ def extract_from_raw_window(window, ticker_pattern):
         except Exception:
             pass
         if ticker_pattern.search(raw_c):
-            content = extract_clean_text(raw_c)
+            cand = extract_clean_text(raw_c)
+            if is_valid_human_message(cand, ticker):
+                content = cand
 
     if not content:
         m = ticker_pattern.search(window)
@@ -1028,15 +1092,11 @@ def extract_from_raw_window(window, ticker_pattern):
         e = m.end()
         while e < len(window) and ord(window[e]) >= 32 and window[e] not in "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0e\x0f":
             e += 1
-        cand = window[s:e].strip()
-        if len(cand) >= 3 and ticker_pattern.search(cand):
+        cand = clean_surrounding_garbage(window[s:e].strip())
+        if is_valid_human_message(cand, ticker):
             content = cand
 
-    if not content:
-        return None
-
-    content = clean_surrounding_garbage(content)
-    if not content or len(content) > 3000:
+    if not content or not is_valid_human_message(content, ticker):
         return None
 
     sender = "Ẩn danh"
@@ -1185,15 +1245,17 @@ def inspect_and_filter_leveldb(file_path, ticker, case_sensitive=False, only_tod
             # Thử bóc tách JSON cân bằng
             json_data = extract_balanced_json(text, pos)
             if json_data:
-                msg_info = extract_message_from_data(json_data, pattern)
+                msg_info = extract_message_from_data(json_data, pattern, ticker)
 
             # Nếu chưa được, thử fallback theo cửa sổ văn bản
             if not msg_info or not msg_info.get("content"):
                 window = text[max(0, pos - 1500) : min(len(text), pos + 1500)]
-                msg_info = extract_from_raw_window(window, pattern)
+                msg_info = extract_from_raw_window(window, pattern, ticker)
 
             if msg_info and msg_info.get("content") and pattern.search(msg_info["content"]):
                 c = msg_info["content"].strip()
+                if not is_valid_human_message(c, ticker):
+                    continue
                 # Loại trừ trường hợp content chỉ là URL hoặc path
                 if c.startswith(("http://", "https://")) and " " not in c:
                     continue
